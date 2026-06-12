@@ -11,6 +11,8 @@ $ ls runs/27357958065/
 artifacts/  logs/  run.json
 ```
 
+During development, prefix with `uv run`:
+
 The repository is auto-detected from the current directory's git remote.
 Override with `--repo ORG/REPO`:
 
@@ -28,16 +30,16 @@ $ gha-downloader run download 27357958065 --job-id 80847830020
 
 ```
 runs/27357958065/
-  run.json                      # workflow run metadata
+  run.json                          # workflow run metadata
   logs/
     <job-slug>/
-      full.log                  # complete job log
-      01_pre.txt                # log before first step group
-      02_set-up-job.txt         # per-group step logs
+      full.log                      # complete job log
+      01_set-up-job.txt             # per-step logs from workflow YAML
+      02_checkout.txt
       ...
   artifacts/
     <artifact-slug>/
-      ...                       # extracted contents
+      ...                           # extracted contents
 ```
 
 Expired artifacts leave a `.expired` marker instead of contents.

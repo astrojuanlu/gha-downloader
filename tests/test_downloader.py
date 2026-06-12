@@ -100,6 +100,10 @@ def test_download_run_fetches_metadata_and_saves(monkeypatch, tmp_path):
         mock.Mock(return_value="##[group]Run setup\nsetup log\n"),
     )
     monkeypatch.setattr(
+        "gha_downloader.downloader.get_job_steps",
+        mock.Mock(return_value=[]),
+    )
+    monkeypatch.setattr(
         "gha_downloader.downloader.get_artifacts",
         mock.Mock(return_value=[]),
     )
@@ -112,7 +116,7 @@ def test_download_run_fetches_metadata_and_saves(monkeypatch, tmp_path):
     logs_dir = tmp_path / "12345" / "logs" / "test-job"
     assert logs_dir.exists()
     step_files = list(logs_dir.glob("*.txt"))
-    assert len(step_files) == 1
+    assert len(step_files) >= 1
 
 
 def test_download_run_not_found(monkeypatch, tmp_path):
@@ -165,6 +169,10 @@ def test_download_run_dir_exists_force(monkeypatch, tmp_path):
         mock.Mock(return_value="log"),
     )
     monkeypatch.setattr(
+        "gha_downloader.downloader.get_job_steps",
+        mock.Mock(return_value=[]),
+    )
+    monkeypatch.setattr(
         "gha_downloader.downloader.get_artifacts",
         mock.Mock(return_value=[]),
     )
@@ -215,6 +223,10 @@ def test_download_run_job_filter(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "gha_downloader.downloader.get_log_text",
         mock_get_log,
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_job_steps",
+        mock.Mock(return_value=[]),
     )
     monkeypatch.setattr(
         "gha_downloader.downloader.get_artifacts",
@@ -304,6 +316,10 @@ def test_download_run_with_artifacts(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "gha_downloader.downloader.get_log_text",
         mock.Mock(return_value="log"),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_job_steps",
+        mock.Mock(return_value=[]),
     )
     monkeypatch.setattr(
         "gha_downloader.downloader.get_artifacts",

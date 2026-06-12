@@ -8,8 +8,8 @@ import structlog
 from .gh import (
     GhExpiredArtifactError,
     GhNotFoundError,
-    download_artifact_zip,
     get_artifacts,
+    get_job_steps,
     get_log_text,
     get_run_view,
 )
@@ -33,12 +33,18 @@ def _clean_step_name(raw: str) -> str:
     name = raw.strip()
     prefix = "Run "
     if name.startswith(prefix):
-        name = name[len(prefix) :]
-        if name.startswith("'") and name.endswith("'"):
-            name = name[1:-1]
-    max_len = 60
-    if len(name) > max_len:
-        name = name[: max_len - 3] + "..."
+        cmd = name[len(prefix) :]
+        if cmd.startswith("'") and cmd.endswith("'"):
+            cmd = cmd[1:-1]
+        if cmd.startswith("sudo "):
+            cmd = cmd[5:]
+        parts = cmd.strip().split(None, 1)
+        executable = parts[0]
+        if "/" in executable:
+            executable = executable.rsplit("/", 1)[-1]
+        if "@" in executable:
+            executable = executable.rsplit("@", 1)[0]
+        name = executable
     return name
 
 
@@ -73,6 +79,35 @@ def _extract_artifact_ids(log_text: str) -> list[int]:
     for m in re.finditer(r"Artifact ID is (\d+)", log_text):
         ids.add(int(m.group(1)))
     return sorted(ids)
+
+
+def _split_log_by_steps(log_text: str, step_times: list) -> dict[str, str]:
+    """Split log into per-step sections using step timing."""
+    # step_times: list of StepData with number, name, startedAt, completedAt
+    step_texts: dict[str, str] = {}
+    step_map: dict[int, str] = {}
+    for s in step_times:
+        label = f"{s.number:02d}_{slugify(s.name)}"
+        step_texts[label] = ""
+        step_map[s.number] = label
+
+    current_label = next(iter(step_texts.values()), "00_raw")
+    for line in log_text.splitlines(keepends=True):
+        ts_match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.", line)
+        if ts_match:
+            line_time = ts_match.group(1)
+            for step in step_times:
+                if step.startedAt and step.startedAt.startswith(line_time):
+                    current_label = step_map.get(step.number, current_label)
+                    break
+                if step.completedAt and step.startedAt:
+                    if step.startedAt <= line_time + "Z" <= step.completedAt:
+                        current_label = step_map.get(step.number, current_label)
+                        break
+        step_texts.setdefault(current_label, "")
+        step_texts[current_label] += line
+
+    return step_texts
 
 
 def _download_job_logs(
@@ -115,22 +150,16 @@ def _download_job_logs(
         artifact_ids = _extract_artifact_ids(log_text)
         all_artifact_ids.extend(artifact_ids)
         if artifact_ids:
-            logger.info(
-                "artifact_ids_found",
-                ids=artifact_ids,
-            )
+            logger.info("artifact_ids_found", ids=artifact_ids)
 
-        steps = split_log(log_text)
-        width = len(str(len(steps)))
-        for step_idx, (step_name, step_text) in enumerate(steps, start=1):
-            step_slug = slugify(step_name)
-            step_file = job_logs_dir / f"{step_idx:0{width}d}_{step_slug}.txt"
-            step_file.write_text(step_text)
-            logger.info(
-                "step_log_saved",
-                path=str(step_file),
-                step=step_name,
-            )
+        step_times = get_job_steps(repo, job.databaseId)
+        step_texts = _split_log_by_steps(log_text, step_times)
+        for label, text in step_texts.items():
+            if not label or not text.strip():
+                continue
+            step_file = job_logs_dir / f"{label}.txt"
+            step_file.write_text(text)
+            logger.info("step_log_saved", path=str(step_file), step=label)
 
     return all_artifact_ids
 
@@ -145,30 +174,15 @@ def _download_artifacts(
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(exist_ok=True)
 
-    if artifact_ids is not None:
-        for art_id in artifact_ids:
-            logger.info("downloading_artifact_by_id", id=art_id)
-            art_dir = artifacts_dir / str(art_id)
-            art_dir.mkdir(exist_ok=True)
-            try:
-                download_artifact_zip(repo, str(art_id), str(art_dir))
-            except GhExpiredArtifactError:
-                print(
-                    f"Warning: Artifact {art_id} has expired.",
-                    file=sys.stderr,
-                )
-                (art_dir / ".expired").touch()
-                continue
-            except GhNotFoundError:
-                logger.warning("artifact_not_found", id=art_id)
-                continue
-        return
-
     try:
         artifacts = get_artifacts(run_id_str, repo=repo)
     except GhNotFoundError:
         logger.warning("no_artifacts_found")
         return
+
+    if artifact_ids is not None:
+        id_set = set(artifact_ids)
+        artifacts = [a for a in artifacts if a.id in id_set]
 
     for artifact in artifacts:
         art_slug = slugify(artifact.name)
@@ -240,3 +254,4 @@ def download_run(
         _download_artifacts(repo, run_id_str, run_dir)
 
     logger.info("download_complete", run_id=run_id, path=str(run_dir))
+    print(f"Done: {run_dir}", file=sys.stderr)

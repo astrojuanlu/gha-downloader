@@ -82,6 +82,8 @@ class StepData(pydantic.BaseModel):
     status: str
     conclusion: str | None = None
     number: int
+    startedAt: str | None = None
+    completedAt: str | None = None
 
 
 class ArtifactData(pydantic.BaseModel):
@@ -133,6 +135,14 @@ def run_gh(args: list[str], retries: int = 3) -> subprocess.CompletedProcess:
 
         stderr_lower = result.stderr.lower()
 
+        if "no git remotes" in stderr_lower or "could not determine" in stderr_lower:
+            print(
+                "Error: Cannot auto-detect repository. "
+                "Run inside a git clone or use --repo ORG/REPO.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
         if "expired" in stderr_lower:
             raise GhExpiredArtifactError(result.stderr.strip())
 
@@ -176,6 +186,24 @@ def _api_endpoint(path: str, repo: str | None) -> str:
         org, name = repo.split("/", 1)
         return path.replace("{owner}", org).replace("{repo}", name)
     return path
+
+
+def get_job_steps(repo: str | None, job_id: int) -> list[StepData]:
+    """Get step timing from job API (includes started_at/completed_at)."""
+    endpoint = _api_endpoint(
+        f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}",
+        repo,
+    )
+    result = run_gh(["api", endpoint])
+    data = json.loads(result.stdout)
+    steps = []
+    for s in data.get("steps", []):
+        if "started_at" in s:
+            s["startedAt"] = s.pop("started_at")
+        if "completed_at" in s:
+            s["completedAt"] = s.pop("completed_at")
+        steps.append(StepData.model_validate(s))
+    return steps
 
 
 def get_run_view(run_id: str, repo: str | None = None) -> RunViewData:

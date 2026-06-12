@@ -1,5 +1,6 @@
 import argparse
 import logging as _logging
+import re
 import signal
 import sys
 
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gha-downloader",
         description="Download logs and artifacts from GitHub Actions runs.",
+        epilog="Use -v for INFO, -vv for DEBUG verbosity. Accepted at any position.",
     )
     subparsers = parser.add_subparsers(dest="command")
     run_parser = subparsers.add_parser("run", help="Work with workflow runs.")
@@ -75,7 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser = run_subparsers.add_parser(
         "download", help="Download run logs and artifacts."
     )
-    download_parser.add_argument("run_id", help="Numeric workflow run ID.")
+    download_parser.add_argument(
+        "run_id",
+        help="Numeric workflow run ID or full Actions URL.",
+    )
     download_parser.add_argument(
         "--repo",
         help="Repository in ORG/REPO format. Auto-detected if omitted.",
@@ -129,8 +134,24 @@ def main() -> None:
 
     if args.command == "run" and args.run_command == "download":
         try:
+            run_id = int(args.run_id)
+        except ValueError:
+            m = re.search(r"/runs/(\d+)", args.run_id)
+            if not m:
+                print(
+                    f"Error: Invalid run ID: {args.run_id!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            run_id = int(m.group(1))
+            if args.job_id is None:
+                jm = re.search(r"/job/(\d+)", args.run_id)
+                if jm:
+                    args.job_id = int(jm.group(1))
+
+        try:
             download_run(
-                run_id=int(args.run_id),
+                run_id=run_id,
                 repo=args.repo,
                 job_id=args.job_id,
                 output_dir=args.dir,
