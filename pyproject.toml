@@ -1,0 +1,52 @@
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[project]
+name = "gha-downloader"
+version = "0.1.0"
+description = "CLI to download logs and artifacts from GitHub Actions runs for further inspection"
+readme = "README.md"
+authors = [
+    { name = "Juan Luis Cano Rodríguez", email = "juan.rodriguez@canonical.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic>=2.13.4",
+    "structlog>=26.1.0",
+]
+
+[project.scripts]
+gha-downloader = "gha_downloader.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.17",
+    "ty>=0.0.49",
+]
+
+[tool.ruff]
+show-fixes = true
+
+[tool.ruff.lint]
+select = [
+    "F",  # Pyflakes
+    "E",  # Pycodestyle
+    "W",  # Pycodestyle
+    "D",  # Pydocstyle
+    "UP",  # pyupgrade
+    "I",  # isort
+    "PL",  # Pylint
+]
+ignore = [
+    "D203",  # incorrect-blank-line-before-class (prefer D211: no-blank-line-before-class)
+    "D213",  # multi-line-summary-second-line (prefer D212: multi-line-summary-first-line)
+    "D100",  # Missing docstring in public module
+    "D103",  # Missing docstring in public function
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["D", "PLR2004"]
+
