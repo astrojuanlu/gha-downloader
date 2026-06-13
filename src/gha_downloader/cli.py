@@ -7,7 +7,14 @@ import sys
 import structlog
 
 from . import repo as repo_module
-from .downloader import download_run
+from .downloader import DownloaderError, download_run
+from .gh import (
+    GhAutoDetectError,
+    GhNetworkError,
+    GhNotFoundError,
+    GhNotInstalledError,
+    GhSpawnError,
+)
 
 logger = structlog.get_logger()
 
@@ -30,8 +37,7 @@ def configure_logging(verbosity: int) -> None:
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
             structlog.dev.ConsoleRenderer(
-                colors=True,
-                force_colors=True,
+                colors=sys.stderr.isatty(),
             ),
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
@@ -49,27 +55,18 @@ def configure_logging(verbosity: int) -> None:
     )
 
 
-def _count_verbosity(raw_args: list[str]) -> int:
-    count = 0
-    for arg in raw_args:
-        if arg in ("-v", "--verbose"):
-            count += 1
-        elif arg.startswith("-v") and set(arg[1:]) == {"v"}:
-            count += len(arg) - 1
-    return count
-
-
-def _filter_verbosity(raw_args: list[str]) -> list[str]:
-    return [
-        a for a in raw_args if not (a == "--verbose" or set(a.lstrip("-")) == {"v"})
-    ]
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gha-downloader",
         description="Download logs and artifacts from GitHub Actions runs.",
-        epilog="Use -v for INFO, -vv for DEBUG verbosity. Accepted at any position.",
+        epilog="Use -v for INFO, -vv for DEBUG verbosity. Must precede the subcommand.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v for INFO, -vv for DEBUG).",
     )
     subparsers = parser.add_subparsers(dest="command")
     run_parser = subparsers.add_parser("run", help="Work with workflow runs.")
@@ -115,14 +112,10 @@ def validate_repo_arg(value: str) -> str:
 def main() -> None:
     signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))
 
-    raw_args = sys.argv[1:]
-    verbosity = _count_verbosity(raw_args)
-    filtered_args = _filter_verbosity(raw_args)
-
-    configure_logging(verbosity)
-
     parser = build_parser()
-    args = parser.parse_args(filtered_args)
+    args = parser.parse_args()
+
+    configure_logging(args.verbose)
 
     if args.command is None:
         parser.print_help()
@@ -159,6 +152,17 @@ def main() -> None:
             )
         except SystemExit:
             raise
-        except BaseException:
+        except (
+            GhNotInstalledError,
+            GhAutoDetectError,
+            GhNotFoundError,
+            DownloaderError,
+        ) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except (GhNetworkError, GhSpawnError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(3)
+        except Exception:
             logger.exception("Internal error")
             sys.exit(1)

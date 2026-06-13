@@ -1,11 +1,8 @@
+import functools
 import json
-import os
 import shutil
 import subprocess
-import sys
-import tempfile
 import time
-import zipfile
 
 import pydantic
 import structlog
@@ -40,10 +37,26 @@ class GhExpiredArtifactError(GhApiError):
     """Artifact has expired (HTTP 410)."""
 
 
+class GhNotInstalledError(GhError):
+    """gh binary not found on PATH."""
+
+
+class GhAutoDetectError(GhError):
+    """Repository cannot be auto-detected."""
+
+
+class GhNetworkError(GhError):
+    """Network failure persists after all retry attempts."""
+
+
+class GhSpawnError(GhError):
+    """OSError on every spawn attempt."""
+
+
 class RunViewData(pydantic.BaseModel):
     """Parsed output of `gh run view --json`."""
 
-    model_config = pydantic.ConfigDict(extra="allow")
+    model_config = pydantic.ConfigDict(extra="ignore")
 
     databaseId: int
     name: str
@@ -60,9 +73,7 @@ class RunViewData(pydantic.BaseModel):
 
 
 class JobData(pydantic.BaseModel):
-    """Job info nested in RunViewData."""
-
-    model_config = pydantic.ConfigDict(extra="allow")
+    model_config = pydantic.ConfigDict(extra="ignore")
 
     databaseId: int
     name: str
@@ -76,7 +87,7 @@ class JobData(pydantic.BaseModel):
 class StepData(pydantic.BaseModel):
     """Step info nested in JobData."""
 
-    model_config = pydantic.ConfigDict(extra="allow")
+    model_config = pydantic.ConfigDict(extra="ignore")
 
     name: str
     status: str
@@ -87,25 +98,20 @@ class StepData(pydantic.BaseModel):
 
 
 class ArtifactData(pydantic.BaseModel):
-    """Artifact info from gh api."""
+    model_config = pydantic.ConfigDict(extra="ignore", populate_by_name=True)
 
-    model_config = pydantic.ConfigDict(extra="allow")
-
-    id: int
+    artifact_id: int = pydantic.Field(alias="id")
     name: str
     size_in_bytes: int
     expired: bool
     archive_download_url: str | None = None
 
 
+@functools.cache
 def find_gh() -> str:
     gh = shutil.which("gh")
     if gh is None:
-        print(
-            "Error: 'gh' CLI not found. Please install GitHub CLI.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        raise GhNotInstalledError("'gh' CLI not found. Please install GitHub CLI.")
     return gh
 
 
@@ -136,12 +142,10 @@ def run_gh(args: list[str], retries: int = 3) -> subprocess.CompletedProcess:
         stderr_lower = result.stderr.lower()
 
         if "no git remotes" in stderr_lower or "could not determine" in stderr_lower:
-            print(
-                "Error: Cannot auto-detect repository. "
-                "Run inside a git clone or use --repo ORG/REPO.",
-                file=sys.stderr,
+            raise GhAutoDetectError(
+                "Cannot auto-detect repository. "
+                "Run inside a git clone or use --repo ORG/REPO."
             )
-            sys.exit(2)
 
         if "expired" in stderr_lower:
             raise GhExpiredArtifactError(result.stderr.strip())
@@ -158,21 +162,11 @@ def run_gh(args: list[str], retries: int = 3) -> subprocess.CompletedProcess:
             if attempt < retries:
                 time.sleep(2 ** (attempt - 1))
                 continue
-            print(
-                f"Error: Network failure after {retries} attempts.",
-                file=sys.stderr,
-            )
-            sys.exit(3)
+            raise GhNetworkError(f"Network failure after {retries} attempts.")
 
         raise GhApiError(result.stderr.strip())
 
-    if last_exc is not None:
-        print(
-            f"Error: Could not spawn gh CLI after {retries} attempts: {last_exc}",
-            file=sys.stderr,
-        )
-        sys.exit(3)
-    sys.exit(3)
+    raise GhSpawnError(f"Could not spawn gh CLI after {retries} attempts: {last_exc}")
 
 
 def _build_repo_args(repo: str | None) -> list[str]:
@@ -185,6 +179,11 @@ def _api_endpoint(path: str, repo: str | None) -> str:
     if repo is not None:
         org, name = repo.split("/", 1)
         return path.replace("{owner}", org).replace("{repo}", name)
+    if "{owner}" in path or "{repo}" in path:
+        raise GhAutoDetectError(
+            "Cannot auto-detect repository. "
+            "Run inside a git clone or use --repo ORG/REPO."
+        )
     return path
 
 
@@ -219,9 +218,7 @@ def get_run_view(run_id: str, repo: str | None = None) -> RunViewData:
 
 def get_log_text(repo: str | None, job_id: int) -> str:
     endpoint = _api_endpoint(
-        "repos/{owner}/{repo}/actions/jobs/{job_id}/logs".replace(
-            "{job_id}", str(job_id)
-        ),
+        f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs",
         repo,
     )
     result = run_gh(["api", endpoint])
@@ -259,46 +256,6 @@ def download_artifact(
         *_build_repo_args(repo),
     ]
     run_gh(args)
-
-
-def download_artifact_zip(
-    repo: str | None,
-    artifact_id: str,
-    output_dir: str,
-) -> None:
-    """Download a single artifact by ID and extract into output_dir."""
-    endpoint = _api_endpoint(
-        f"repos/{{owner}}/{{repo}}/actions/artifacts/{artifact_id}/zip",
-        repo,
-    )
-    gh = find_gh()
-    cmd = [gh, "api", endpoint]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        stderr_text = result.stderr
-        if isinstance(stderr_text, bytes):
-            stderr_text = stderr_text.decode(errors="replace")
-        stderr_lower = stderr_text.lower()
-        if "expired" in stderr_lower:
-            raise GhExpiredArtifactError(stderr_text)
-        if "not found" in stderr_lower:
-            raise GhNotFoundError(stderr_text)
-        raise GhApiError(stderr_text)
-
-    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
-        tf.write(result.stdout)
-        tmp_path = tf.name
-
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        with zipfile.ZipFile(tmp_path) as zf:
-            zf.extractall(output_dir)
-    finally:
-        os.unlink(tmp_path)
 
 
 def _is_network_error(stderr_lower: str) -> bool:

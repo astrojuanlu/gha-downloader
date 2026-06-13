@@ -7,10 +7,13 @@ import pytest
 
 from gha_downloader.gh import (
     GhApiError,
+    GhAutoDetectError,
     GhExpiredArtifactError,
+    GhNetworkError,
     GhNotFoundError,
+    GhNotInstalledError,
+    GhSpawnError,
     RunViewData,
-    download_artifact_zip,
     find_gh,
     get_artifacts,
     get_log_text,
@@ -26,6 +29,7 @@ def _make_result(returncode=0, stdout="", stderr=""):
 
 
 def test_find_gh_found(monkeypatch):
+    find_gh.cache_clear()
     monkeypatch.setattr(
         "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
     )
@@ -33,13 +37,14 @@ def test_find_gh_found(monkeypatch):
 
 
 def test_find_gh_not_found(monkeypatch):
+    find_gh.cache_clear()
     monkeypatch.setattr("gha_downloader.gh.shutil.which", mock.Mock(return_value=None))
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(GhNotInstalledError):
         find_gh()
-    assert exc.value.code == 2
 
 
 def test_run_gh_success(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(return_value=_make_result(stdout="ok"))
     monkeypatch.setattr(subprocess, "run", mock_run)
     monkeypatch.setattr(
@@ -51,6 +56,7 @@ def test_run_gh_success(monkeypatch):
 
 
 def test_run_gh_with_repo(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(return_value=_make_result(stdout="ok"))
     monkeypatch.setattr(subprocess, "run", mock_run)
     monkeypatch.setattr(
@@ -63,6 +69,7 @@ def test_run_gh_with_repo(monkeypatch):
 
 
 def test_run_gh_not_found(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(returncode=1, stderr="not found (HTTP 404)")
     )
@@ -75,6 +82,7 @@ def test_run_gh_not_found(monkeypatch):
 
 
 def test_run_gh_expired(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(returncode=1, stderr="artifact expired")
     )
@@ -87,6 +95,7 @@ def test_run_gh_expired(monkeypatch):
 
 
 def test_run_gh_network_error_retries(monkeypatch):
+    find_gh.cache_clear()
     call_count = [0]
 
     def side_effect(*args, **kwargs):
@@ -107,6 +116,7 @@ def test_run_gh_network_error_retries(monkeypatch):
 
 
 def test_run_gh_network_error_exhausted(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(
             returncode=1, stderr="connect: network is unreachable"
@@ -117,12 +127,25 @@ def test_run_gh_network_error_exhausted(monkeypatch):
     monkeypatch.setattr(
         "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
     )
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(GhNetworkError):
         run_gh(["test"])
-    assert exc.value.code == 3
+
+
+def test_run_gh_auto_detect_error(monkeypatch):
+    find_gh.cache_clear()
+    mock_run = mock.Mock(
+        return_value=_make_result(returncode=1, stderr="no git remotes")
+    )
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(
+        "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
+    )
+    with pytest.raises(GhAutoDetectError):
+        run_gh(["test"])
 
 
 def test_run_gh_api_error(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(returncode=1, stderr="some API error")
     )
@@ -135,6 +158,7 @@ def test_run_gh_api_error(monkeypatch):
 
 
 def test_get_run_view(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(
             stdout=json.dumps(
@@ -167,6 +191,7 @@ def test_get_run_view(monkeypatch):
 
 
 def test_get_run_view_with_repo(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(
             stdout=json.dumps(
@@ -198,6 +223,7 @@ def test_get_run_view_with_repo(monkeypatch):
 
 
 def test_get_log_text(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(stdout="##[group]Run tests\nlog line\n##[endgroup]")
     )
@@ -205,11 +231,12 @@ def test_get_log_text(monkeypatch):
     monkeypatch.setattr(
         "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
     )
-    result = get_log_text(None, 42)
+    result = get_log_text("myorg/myrepo", 42)
     assert "##[group]" in result
 
 
 def test_get_log_text_with_repo(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(return_value=_make_result(stdout="log text"))
     monkeypatch.setattr(subprocess, "run", mock_run)
     monkeypatch.setattr(
@@ -222,6 +249,7 @@ def test_get_log_text_with_repo(monkeypatch):
 
 
 def test_get_artifacts(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(
             stdout=json.dumps(
@@ -250,13 +278,14 @@ def test_get_artifacts(monkeypatch):
         "gha_downloader.gh.shutil.which",
         mock.Mock(return_value="/usr/bin/gh"),
     )
-    result = get_artifacts("12345")
+    result = get_artifacts("12345", repo="myorg/myrepo")
     assert len(result) == 2
     assert result[0].name == "build-output"
     assert result[0].expired is False
 
 
 def test_get_artifacts_expired(monkeypatch):
+    find_gh.cache_clear()
     mock_run = mock.Mock(
         return_value=_make_result(
             stdout=json.dumps(
@@ -275,12 +304,13 @@ def test_get_artifacts_expired(monkeypatch):
         "gha_downloader.gh.shutil.which",
         mock.Mock(return_value="/usr/bin/gh"),
     )
-    result = get_artifacts("12345")
+    result = get_artifacts("12345", repo="myorg/myrepo")
     assert len(result) == 1
     assert result[0].expired is True
 
 
 def test_run_gh_oserror_retries(monkeypatch):
+    find_gh.cache_clear()
     call_count = [0]
 
     def side_effect(*args, **kwargs):
@@ -300,39 +330,16 @@ def test_run_gh_oserror_retries(monkeypatch):
     assert call_count[0] == 3
 
 
-def test_download_artifact_zip_success(monkeypatch, tmp_path):
-    mock_run = mock.Mock(return_value=_make_result(stdout=b"PK\x03\x04fakezip"))
-    monkeypatch.setattr(subprocess, "run", mock_run)
+def test_run_gh_oserror_exhausted(monkeypatch):
+    find_gh.cache_clear()
+    monkeypatch.setattr(
+        subprocess, "run", mock.Mock(side_effect=OSError("spawn failed"))
+    )
+    mock_sleep = mock.Mock()
+    monkeypatch.setattr(time, "sleep", mock_sleep)
     monkeypatch.setattr(
         "gha_downloader.gh.shutil.which",
         mock.Mock(return_value="/usr/bin/gh"),
     )
-    monkeypatch.setattr("gha_downloader.gh.zipfile.ZipFile", mock.MagicMock())
-    out = str(tmp_path / "out")
-    download_artifact_zip("myorg/myrepo", "123", out)
-
-
-def test_download_artifact_zip_expired(monkeypatch, tmp_path):
-    mock_run = mock.Mock(
-        return_value=_make_result(returncode=1, stderr="artifact expired")
-    )
-    monkeypatch.setattr(subprocess, "run", mock_run)
-    monkeypatch.setattr(
-        "gha_downloader.gh.shutil.which",
-        mock.Mock(return_value="/usr/bin/gh"),
-    )
-    out = str(tmp_path / "out")
-    with pytest.raises(GhExpiredArtifactError):
-        download_artifact_zip("myorg/myrepo", "123", out)
-
-
-def test_download_artifact_zip_not_found(monkeypatch, tmp_path):
-    mock_run = mock.Mock(return_value=_make_result(returncode=1, stderr="not found"))
-    monkeypatch.setattr(subprocess, "run", mock_run)
-    monkeypatch.setattr(
-        "gha_downloader.gh.shutil.which",
-        mock.Mock(return_value="/usr/bin/gh"),
-    )
-    out = str(tmp_path / "out")
-    with pytest.raises(GhNotFoundError):
-        download_artifact_zip("myorg/myrepo", "123", out)
+    with pytest.raises(GhSpawnError):
+        run_gh(["test"])

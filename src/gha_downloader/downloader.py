@@ -1,3 +1,4 @@
+import datetime as dt
 import re
 import shutil
 import sys
@@ -18,6 +19,10 @@ from .gh import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+class DownloaderError(Exception):
+    """User-input or state error in the download layer."""
 
 
 def slugify(name: str) -> str:
@@ -48,31 +53,6 @@ def _clean_step_name(raw: str) -> str:
     return name
 
 
-def split_log(log_text: str) -> list[tuple[str, str]]:
-    """Split job log into (step_name, step_text) pairs on ##[group] markers."""
-    if "##[group]" not in log_text:
-        return [("raw", log_text)]
-
-    steps: list[tuple[str, str]] = []
-    current_name = "pre"
-    current_lines: list[str] = []
-
-    for line in log_text.splitlines(keepends=True):
-        group_match = re.search(r"##\[group\](.*)", line)
-        if group_match:
-            if current_lines:
-                steps.append((current_name, "".join(current_lines)))
-            current_name = _clean_step_name(group_match.group(1))
-            current_lines = []
-        else:
-            current_lines.append(line)
-
-    if current_lines or steps:
-        steps.append((current_name, "".join(current_lines)))
-
-    return steps
-
-
 def _extract_artifact_ids(log_text: str) -> list[int]:
     """Extract artifact IDs from job log upload messages."""
     ids: set[int] = set()
@@ -81,9 +61,12 @@ def _extract_artifact_ids(log_text: str) -> list[int]:
     return sorted(ids)
 
 
+def _parse_ts(ts: str) -> dt.datetime:
+    normalized = ts.replace("Z", "+00:00")
+    return dt.datetime.fromisoformat(normalized)
+
+
 def _split_log_by_steps(log_text: str, step_times: list) -> dict[str, str]:
-    """Split log into per-step sections using step timing."""
-    # step_times: list of StepData with number, name, startedAt, completedAt
     step_texts: dict[str, str] = {}
     step_map: dict[int, str] = {}
     for s in step_times:
@@ -91,19 +74,23 @@ def _split_log_by_steps(log_text: str, step_times: list) -> dict[str, str]:
         step_texts[label] = ""
         step_map[s.number] = label
 
-    current_label = next(iter(step_texts.values()), "00_raw")
+    current_label = next(iter(step_texts), "00_raw")
     for line in log_text.splitlines(keepends=True):
-        ts_match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.", line)
+        ts_match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)", line)
         if ts_match:
-            line_time = ts_match.group(1)
+            line_time = _parse_ts(ts_match.group(1))
             for step in step_times:
-                if step.startedAt and step.startedAt.startswith(line_time):
-                    current_label = step_map.get(step.number, current_label)
-                    break
-                if step.completedAt and step.startedAt:
-                    if step.startedAt <= line_time + "Z" <= step.completedAt:
-                        current_label = step_map.get(step.number, current_label)
-                        break
+                if not step.startedAt:
+                    continue
+                started = _parse_ts(step.startedAt)
+                if line_time < started:
+                    continue
+                if step.completedAt:
+                    completed = _parse_ts(step.completedAt)
+                    if line_time >= completed:
+                        continue
+                current_label = step_map.get(step.number, current_label)
+                break
         step_texts.setdefault(current_label, "")
         step_texts[current_label] += line
 
@@ -121,11 +108,7 @@ def _download_job_logs(
     if job_id is not None:
         jobs = [j for j in jobs if j.databaseId == job_id]
         if not jobs:
-            print(
-                f"Error: Job ID {job_id} not found in run {run_id}.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
+            raise DownloaderError(f"Job ID {job_id} not found in run {run_id}.")
 
     logger.info("downloading_logs", job_count=len(jobs))
     logs_dir = run_dir / "logs"
@@ -182,7 +165,7 @@ def _download_artifacts(
 
     if artifact_ids is not None:
         id_set = set(artifact_ids)
-        artifacts = [a for a in artifacts if a.id in id_set]
+        artifacts = [a for a in artifacts if a.artifact_id in id_set]
 
     for artifact in artifacts:
         art_slug = slugify(artifact.name)
@@ -222,23 +205,16 @@ def download_run(
 
     if run_dir.exists():
         if not force:
-            print(
-                f"Error: Destination {run_dir} already exists. "
-                "Use --force to overwrite.",
-                file=sys.stderr,
+            raise DownloaderError(
+                f"Destination {run_dir} already exists. Use --force to overwrite."
             )
-            sys.exit(2)
         logger.info("removing_existing", path=str(run_dir))
         shutil.rmtree(run_dir)
 
     run_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("fetching_run_metadata", run_id=run_id)
-    try:
-        run_data = get_run_view(run_id_str, repo=repo)
-    except GhNotFoundError:
-        print(f"Error: Run {run_id} not found.", file=sys.stderr)
-        sys.exit(2)
+    run_data = get_run_view(run_id_str, repo=repo)
 
     run_json_path = run_dir / "run.json"
     run_json_path.write_text(run_data.model_dump_json(indent=2))

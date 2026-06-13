@@ -1,46 +1,6 @@
 import pytest
 
-from gha_downloader.cli import _count_verbosity, _filter_verbosity, build_parser
-
-
-def test_count_verbosity_none():
-    assert _count_verbosity(["run", "download", "12345"]) == 0
-
-
-def test_count_verbosity_single():
-    assert _count_verbosity(["-v", "run", "download", "12345"]) == 1
-
-
-def test_count_verbosity_double():
-    assert _count_verbosity(["-vv", "run", "download", "12345"]) == 2
-
-
-def test_count_verbosity_triple():
-    assert _count_verbosity(["-vvv", "run", "download", "12345"]) == 3
-
-
-def test_count_verbosity_after_subcommand():
-    assert _count_verbosity(["run", "download", "12345", "-vv"]) == 2
-
-
-def test_count_verbosity_verbose_flag():
-    assert _count_verbosity(["--verbose", "run", "download", "12345"]) == 1
-
-
-def test_filter_verbosity_removes_v():
-    assert _filter_verbosity(["-vv", "run", "download", "12345"]) == [
-        "run",
-        "download",
-        "12345",
-    ]
-
-
-def test_filter_verbosity_removes_verbose():
-    assert _filter_verbosity(["--verbose", "run", "download", "12345"]) == [
-        "run",
-        "download",
-        "12345",
-    ]
+from gha_downloader.cli import build_parser
 
 
 def test_run_download_minimal():
@@ -51,6 +11,7 @@ def test_run_download_minimal():
     assert args.job_id is None
     assert args.dir == "./runs"
     assert args.force is False
+    assert args.verbose == 0
 
 
 def test_run_download_all_flags():
@@ -111,3 +72,27 @@ def test_help_flag():
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["--help"])
+
+
+def test_verbose_single():
+    parser = build_parser()
+    args = parser.parse_args(["-v", "run", "download", "12345"])
+    assert args.verbose == 1
+
+
+def test_verbose_double():
+    parser = build_parser()
+    args = parser.parse_args(["-vv", "run", "download", "12345"])
+    assert args.verbose == 2
+
+
+def test_verbose_default_zero():
+    parser = build_parser()
+    args = parser.parse_args(["run", "download", "12345"])
+    assert args.verbose == 0
+
+
+def test_verbose_after_subcommand_rejected():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "download", "-v", "12345"])
