@@ -16,6 +16,7 @@ dependencies = [
     "ruamel.yaml>=0.18.10",
     "structlog>=26.1.0",
 ]
+license = "NOASSERTION"
 
 [project.scripts]
 gha-downloader = "gha_downloader.cli:main"

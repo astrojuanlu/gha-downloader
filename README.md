@@ -1,5 +1,7 @@
 # gha-downloader
 
+![Warning: Vibe Coded](https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F_warning-vibe_coded-orange?style=flat)
+
 Download logs and artifacts from GitHub Actions runs for offline inspection.
 
 ## Usage
