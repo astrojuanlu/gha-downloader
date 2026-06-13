@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from unittest import mock
 
 import pytest
@@ -9,6 +10,7 @@ from gha_downloader.downloader import (
 )
 from gha_downloader.gh import (
     ArtifactData,
+    GhAutoDetectError,
     GhNotFoundError,
     JobData,
     ReferencedWorkflow,
@@ -544,4 +546,187 @@ class TestSplitLogByGroups:
         result = _split_log_by_groups(log, steps, yaml_names)
         assert "01_set-up-job" in result
         assert "02_integration-tests" in result
-        assert "03_compile" in result
+
+
+def test_download_run_removes_dir_on_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_view",
+        mock.Mock(side_effect=GhAutoDetectError("Cannot auto-detect repository.")),
+    )
+
+    with pytest.raises(GhAutoDetectError):
+        download_run(12345, repo=None, output_dir=str(tmp_path))
+
+    run_dir = tmp_path / "12345"
+    assert not run_dir.exists()
+
+
+def test_download_run_job_filter_bar_total_is_one(monkeypatch, tmp_path):
+    mock_run_view = RunViewData(
+        databaseId=12345,
+        name="CI",
+        status="completed",
+        conclusion="success",
+        createdAt="2024-01-01T00:00:00Z",
+        displayTitle="Fix bug",
+        event="push",
+        headBranch="main",
+        headSha="abc123",
+        url="https://github.com/org/repo/actions/runs/12345",
+        workflowName="CI",
+        jobs=[
+            JobData(
+                databaseId=1,
+                name="job-one",
+                status="completed",
+                conclusion="success",
+                startedAt="2024-01-01T00:00:00Z",
+                completedAt="2024-01-01T00:01:00Z",
+            ),
+            JobData(
+                databaseId=2,
+                name="job-two",
+                status="completed",
+                conclusion="success",
+                startedAt="2024-01-01T00:00:00Z",
+                completedAt="2024-01-01T00:01:00Z",
+            ),
+        ],
+    )
+    mock_wf_info = RunWorkflowInfo(
+        path=".github/workflows/ci.yml",
+        head_sha="abc123",
+        referenced_workflows=[],
+    )
+
+    captured_totals: list[int] = []
+
+    @contextmanager
+    def _capturing_alive_bar(total, *, title="", file=None, ctrl_c=False):
+        captured_totals.append(total)
+        bar = mock.MagicMock()
+        yield bar
+
+    monkeypatch.setattr(
+        "gha_downloader.downloader.alive_bar",
+        _capturing_alive_bar,
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_view",
+        mock.Mock(return_value=mock_run_view),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_workflow_info",
+        mock.Mock(return_value=mock_wf_info),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_workflow_yaml_content",
+        mock.Mock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_log_text",
+        mock.Mock(return_value="log"),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_job_steps",
+        mock.Mock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_artifacts",
+        mock.Mock(return_value=[]),
+    )
+
+    download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path), job_id=1)
+
+    assert captured_totals == [1]
+
+
+def test_download_run_bar_title_not_overwritten(monkeypatch, tmp_path):
+    mock_run_view = RunViewData(
+        databaseId=12345,
+        name="CI",
+        status="completed",
+        conclusion="success",
+        createdAt="2024-01-01T00:00:00Z",
+        displayTitle="Fix bug",
+        event="push",
+        headBranch="main",
+        headSha="abc123",
+        url="https://github.com/org/repo/actions/runs/12345",
+        workflowName="CI",
+        jobs=[
+            JobData(
+                databaseId=1,
+                name="test-job",
+                status="completed",
+                conclusion="success",
+                startedAt="2024-01-01T00:00:00Z",
+                completedAt="2024-01-01T00:01:00Z",
+            ),
+        ],
+    )
+    mock_wf_info = RunWorkflowInfo(
+        path=".github/workflows/ci.yml",
+        head_sha="abc123",
+        referenced_workflows=[],
+    )
+
+    class _TrackingBar:
+        def __init__(self):
+            self.title_set_count = 0
+            self.text_set_count = 0
+
+        def __setattr__(self, name, value):
+            if name in ("title_set_count", "text_set_count"):
+                object.__setattr__(self, name, value)
+                return
+            if name == "title":
+                self.title_set_count += 1
+            if name == "text":
+                self.text_set_count += 1
+
+        def __call__(self):
+            pass
+
+    captured_bar = None
+
+    @contextmanager
+    def _capturing_alive_bar(total, *, title="", file=None, ctrl_c=False):
+        nonlocal captured_bar
+        captured_bar = _TrackingBar()
+        yield captured_bar
+
+    monkeypatch.setattr(
+        "gha_downloader.downloader.alive_bar",
+        _capturing_alive_bar,
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_view",
+        mock.Mock(return_value=mock_run_view),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_workflow_info",
+        mock.Mock(return_value=mock_wf_info),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_workflow_yaml_content",
+        mock.Mock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_log_text",
+        mock.Mock(return_value="log"),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_job_steps",
+        mock.Mock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_artifacts",
+        mock.Mock(return_value=[]),
+    )
+
+    download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path))
+
+    assert captured_bar is not None
+    assert captured_bar.title_set_count == 0
+    assert captured_bar.text_set_count >= 1

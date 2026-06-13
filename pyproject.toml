@@ -12,6 +12,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "alive-progress>=3.3.0",
     "pydantic>=2.13.4",
     "ruamel.yaml>=0.18.10",
     "structlog>=26.1.0",

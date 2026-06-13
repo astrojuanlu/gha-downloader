@@ -2,8 +2,10 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import structlog
+from alive_progress import alive_bar
 from ruamel.yaml import YAML
 
 from .gh import (
@@ -126,17 +128,12 @@ def _build_yaml_step_names(yaml_content: str, job_name: str) -> dict[int, str]:
 
 def _download_job_logs(
     repo: str | None,
-    job_id: int | None,
     jobs: list,
     run_dir: Path,
     run_id: int,
+    bar: Any | None = None,
 ) -> list[int]:
     """Download logs for selected jobs. Returns artifact IDs found in logs."""
-    if job_id is not None:
-        jobs = [j for j in jobs if j.databaseId == job_id]
-        if not jobs:
-            raise DownloaderError(f"Job ID {job_id} not found in run {run_id}.")
-
     run_id_str = str(run_id)
     wf_info = get_run_workflow_info(repo, run_id_str)
     is_reusable = bool(wf_info.referenced_workflows)
@@ -155,6 +152,8 @@ def _download_job_logs(
     all_artifact_ids: list[int] = []
 
     for job in jobs:
+        if bar is not None:
+            bar.text = job.name
         job_slug = slugify(job.name)
         job_logs_dir = logs_dir / job_slug
         job_logs_dir.mkdir(exist_ok=True)
@@ -182,6 +181,9 @@ def _download_job_logs(
             step_file.write_text(text)
             logger.info("step_log_saved", path=str(step_file), step=label)
 
+        if bar is not None:
+            bar()
+
     return all_artifact_ids
 
 
@@ -190,7 +192,7 @@ def _download_artifacts(
     run_id_str: str,
     run_dir: Path,
     artifact_ids: list[int] | None = None,
-) -> None:
+) -> int:
     logger.info("downloading_artifacts")
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(exist_ok=True)
@@ -199,7 +201,7 @@ def _download_artifacts(
         artifacts = get_artifacts(run_id_str, repo=repo)
     except GhNotFoundError:
         logger.warning("no_artifacts_found")
-        return
+        return 0
 
     if artifact_ids is not None:
         id_set = set(artifact_ids)
@@ -230,6 +232,8 @@ def _download_artifacts(
             (art_dir / ".expired").touch()
             continue
 
+    return len(artifacts)
+
 
 def download_run(
     run_id: int,
@@ -241,7 +245,8 @@ def download_run(
     run_id_str = str(run_id)
     run_dir = Path(output_dir) / run_id_str
 
-    if run_dir.exists():
+    dir_existed_before = run_dir.exists()
+    if dir_existed_before:
         if not force:
             raise DownloaderError(
                 f"Destination {run_dir} already exists. Use --force to overwrite."
@@ -251,21 +256,47 @@ def download_run(
 
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("fetching_run_metadata", run_id=run_id)
-    run_data = get_run_view(run_id_str, repo=repo)
+    try:
+        logger.info("fetching_run_metadata", run_id=run_id)
+        run_data = get_run_view(run_id_str, repo=repo)
 
-    run_json_path = run_dir / "run.json"
-    run_json_path.write_text(run_data.model_dump_json(indent=2))
-    logger.info("run_metadata_saved", path=str(run_json_path))
+        run_json_path = run_dir / "run.json"
+        run_json_path.write_text(run_data.model_dump_json(indent=2))
+        logger.info("run_metadata_saved", path=str(run_json_path))
 
-    artifact_ids = _download_job_logs(
-        repo, job_id, run_data.jobs or [], run_dir, run_id
-    )
-    if job_id is not None:
-        if artifact_ids:
-            _download_artifacts(repo, run_id_str, run_dir, artifact_ids)
-    else:
-        _download_artifacts(repo, run_id_str, run_dir)
+        all_jobs = run_data.jobs or []
+        if job_id is not None:
+            jobs_to_download = [j for j in all_jobs if j.databaseId == job_id]
+            if not jobs_to_download:
+                raise DownloaderError(f"Job ID {job_id} not found in run {run_id}.")
+        else:
+            jobs_to_download = all_jobs
 
-    logger.info("download_complete", run_id=run_id, path=str(run_dir))
-    print(f"Done: {run_dir}", file=sys.stderr)
+        bar_title = f"Job {job_id}" if job_id else "Downloading"
+        with alive_bar(
+            len(jobs_to_download),
+            title=bar_title,
+            file=sys.stderr,
+            ctrl_c=False,
+        ) as bar:
+            artifact_ids = _download_job_logs(
+                repo, jobs_to_download, run_dir, run_id, bar=bar
+            )
+            if job_id is not None:
+                if artifact_ids:
+                    art_count = _download_artifacts(
+                        repo, run_id_str, run_dir, artifact_ids
+                    )
+                else:
+                    art_count = 0
+            else:
+                art_count = _download_artifacts(repo, run_id_str, run_dir)
+
+            bar.text = (
+                f"{art_count} artifact{'s' if art_count != 1 else ''} → {run_dir}"
+            )
+
+        logger.info("download_complete", run_id=run_id, path=str(run_dir))
+    except BaseException:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
