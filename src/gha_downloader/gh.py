@@ -1,3 +1,4 @@
+import base64
 import functools
 import json
 import shutil
@@ -73,6 +74,8 @@ class RunViewData(pydantic.BaseModel):
 
 
 class JobData(pydantic.BaseModel):
+    """Job info nested in RunViewData."""
+
     model_config = pydantic.ConfigDict(extra="ignore")
 
     databaseId: int
@@ -98,6 +101,8 @@ class StepData(pydantic.BaseModel):
 
 
 class ArtifactData(pydantic.BaseModel):
+    """Artifact info from gh api."""
+
     model_config = pydantic.ConfigDict(extra="ignore", populate_by_name=True)
 
     artifact_id: int = pydantic.Field(alias="id")
@@ -105,6 +110,25 @@ class ArtifactData(pydantic.BaseModel):
     size_in_bytes: int
     expired: bool
     archive_download_url: str | None = None
+
+
+class ReferencedWorkflow(pydantic.BaseModel):
+    """Referenced workflow in a reusable workflow run."""
+
+    model_config = pydantic.ConfigDict(extra="ignore")
+
+    path: str
+    sha: str
+
+
+class RunWorkflowInfo(pydantic.BaseModel):
+    """Workflow metadata for a run (path, SHA, referenced workflows)."""
+
+    model_config = pydantic.ConfigDict(extra="ignore")
+
+    path: str
+    head_sha: str
+    referenced_workflows: list[ReferencedWorkflow] = []
 
 
 @functools.cache
@@ -256,6 +280,31 @@ def download_artifact(
         *_build_repo_args(repo),
     ]
     run_gh(args)
+
+
+def get_run_workflow_info(repo: str | None, run_id: str) -> RunWorkflowInfo:
+    endpoint = _api_endpoint(
+        f"repos/{{owner}}/{{repo}}/actions/runs/{run_id}",
+        repo,
+    )
+    result = run_gh(["api", endpoint])
+    data = json.loads(result.stdout)
+    return RunWorkflowInfo.model_validate(data)
+
+
+def get_workflow_yaml_content(repo: str | None, path: str, sha: str) -> str | None:
+    endpoint = _api_endpoint(
+        f"repos/{{owner}}/{{repo}}/contents/{path}?ref={sha}",
+        repo,
+    )
+    try:
+        result = run_gh(["api", endpoint])
+        data = json.loads(result.stdout)
+        content = data.get("content", "")
+        return base64.b64decode(content).decode("utf-8")
+    except Exception:
+        logger.debug("workflow_yaml_fetch_failed", path=path, sha=sha)
+        return None
 
 
 def _is_network_error(stderr_lower: str) -> bool:

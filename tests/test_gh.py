@@ -1,3 +1,4 @@
+import base64
 import json
 import subprocess
 import time
@@ -13,11 +14,15 @@ from gha_downloader.gh import (
     GhNotFoundError,
     GhNotInstalledError,
     GhSpawnError,
+    ReferencedWorkflow,
     RunViewData,
+    RunWorkflowInfo,
     find_gh,
     get_artifacts,
     get_log_text,
     get_run_view,
+    get_run_workflow_info,
+    get_workflow_yaml_content,
     run_gh,
 )
 
@@ -343,3 +348,87 @@ def test_run_gh_oserror_exhausted(monkeypatch):
     )
     with pytest.raises(GhSpawnError):
         run_gh(["test"])
+
+
+def test_get_run_workflow_info_non_reusable(monkeypatch):
+    find_gh.cache_clear()
+    mock_run = mock.Mock(
+        return_value=_make_result(
+            stdout=json.dumps(
+                {
+                    "path": ".github/workflows/ci.yml",
+                    "head_sha": "abc123",
+                    "referenced_workflows": [],
+                }
+            )
+        )
+    )
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(
+        "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
+    )
+    result = get_run_workflow_info("myorg/myrepo", "12345")
+    assert isinstance(result, RunWorkflowInfo)
+    assert result.path == ".github/workflows/ci.yml"
+    assert result.head_sha == "abc123"
+    assert result.referenced_workflows == []
+
+
+def test_get_run_workflow_info_reusable(monkeypatch):
+    find_gh.cache_clear()
+    mock_run = mock.Mock(
+        return_value=_make_result(
+            stdout=json.dumps(
+                {
+                    "path": ".github/workflows/caller.yml",
+                    "head_sha": "def456",
+                    "referenced_workflows": [
+                        {"path": ".github/workflows/reusable.yml", "sha": "789"}
+                    ],
+                }
+            )
+        )
+    )
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(
+        "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
+    )
+    result = get_run_workflow_info("myorg/myrepo", "12345")
+    assert len(result.referenced_workflows) == 1
+    assert isinstance(result.referenced_workflows[0], ReferencedWorkflow)
+    assert result.referenced_workflows[0].path == ".github/workflows/reusable.yml"
+
+
+def test_get_workflow_yaml_content_success(monkeypatch):
+    find_gh.cache_clear()
+    yaml_text = "jobs:\n  build:\n    steps:\n      - run: echo hello\n"
+    encoded = base64.b64encode(yaml_text.encode()).decode()
+    mock_run = mock.Mock(
+        return_value=_make_result(
+            stdout=json.dumps({"content": encoded, "encoding": "base64"})
+        )
+    )
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(
+        "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
+    )
+    result = get_workflow_yaml_content(
+        "myorg/myrepo", ".github/workflows/ci.yml", "abc123"
+    )
+    assert result is not None
+    assert "build" in result
+
+
+def test_get_workflow_yaml_content_error_returns_none(monkeypatch):
+    find_gh.cache_clear()
+    monkeypatch.setattr(
+        "gha_downloader.gh.run_gh",
+        mock.Mock(side_effect=GhNotFoundError("not found")),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
+    )
+    result = get_workflow_yaml_content(
+        "myorg/myrepo", ".github/workflows/ci.yml", "abc123"
+    )
+    assert result is None

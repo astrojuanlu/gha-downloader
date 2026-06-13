@@ -4,14 +4,16 @@ import pytest
 
 from gha_downloader.downloader import (
     DownloaderError,
-    _split_log_by_steps,
+    _split_log_by_groups,
     download_run,
 )
 from gha_downloader.gh import (
     ArtifactData,
     GhNotFoundError,
     JobData,
+    ReferencedWorkflow,
     RunViewData,
+    RunWorkflowInfo,
     StepData,
 )
 
@@ -48,10 +50,23 @@ def test_download_run_fetches_metadata_and_saves(monkeypatch, tmp_path):
             )
         ],
     )
+    mock_wf_info = RunWorkflowInfo(
+        path=".github/workflows/ci.yml",
+        head_sha="abc123",
+        referenced_workflows=[],
+    )
 
     monkeypatch.setattr(
         "gha_downloader.downloader.get_run_view",
         mock.Mock(return_value=mock_run_view),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_workflow_info",
+        mock.Mock(return_value=mock_wf_info),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_workflow_yaml_content",
+        mock.Mock(return_value=None),
     )
     monkeypatch.setattr(
         "gha_downloader.downloader.get_log_text",
@@ -73,8 +88,7 @@ def test_download_run_fetches_metadata_and_saves(monkeypatch, tmp_path):
 
     logs_dir = tmp_path / "12345" / "logs" / "test-job"
     assert logs_dir.exists()
-    step_files = list(logs_dir.glob("*.txt"))
-    assert len(step_files) >= 1
+    assert (logs_dir / "full.log").exists()
 
 
 def test_download_run_not_found(monkeypatch, tmp_path):
@@ -115,10 +129,23 @@ def test_download_run_dir_exists_force(monkeypatch, tmp_path):
         url="https://github.com/org/repo/actions/runs/12345",
         workflowName="CI",
     )
+    mock_wf_info = RunWorkflowInfo(
+        path=".github/workflows/ci.yml",
+        head_sha="abc123",
+        referenced_workflows=[],
+    )
 
     monkeypatch.setattr(
         "gha_downloader.downloader.get_run_view",
         mock.Mock(return_value=mock_run_view),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_workflow_info",
+        mock.Mock(return_value=mock_wf_info),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_workflow_yaml_content",
+        mock.Mock(return_value=None),
     )
     monkeypatch.setattr(
         "gha_downloader.downloader.get_log_text",
@@ -170,10 +197,23 @@ def test_download_run_job_filter(monkeypatch, tmp_path):
             ),
         ],
     )
+    mock_wf_info = RunWorkflowInfo(
+        path=".github/workflows/ci.yml",
+        head_sha="abc123",
+        referenced_workflows=[],
+    )
 
     monkeypatch.setattr(
         "gha_downloader.downloader.get_run_view",
         mock.Mock(return_value=mock_run_view),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_workflow_info",
+        mock.Mock(return_value=mock_wf_info),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_workflow_yaml_content",
+        mock.Mock(return_value=None),
     )
     mock_get_log = mock.Mock(return_value="log text")
     monkeypatch.setattr(
@@ -256,6 +296,11 @@ def test_download_run_with_artifacts(monkeypatch, tmp_path):
             ),
         ],
     )
+    mock_wf_info = RunWorkflowInfo(
+        path=".github/workflows/ci.yml",
+        head_sha="abc123",
+        referenced_workflows=[],
+    )
 
     mock_artifact = ArtifactData.model_validate(
         {
@@ -269,6 +314,14 @@ def test_download_run_with_artifacts(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "gha_downloader.downloader.get_run_view",
         mock.Mock(return_value=mock_run_view),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_workflow_info",
+        mock.Mock(return_value=mock_wf_info),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_workflow_yaml_content",
+        mock.Mock(return_value=None),
     )
     monkeypatch.setattr(
         "gha_downloader.downloader.get_log_text",
@@ -294,78 +347,201 @@ def test_download_run_with_artifacts(monkeypatch, tmp_path):
     assert mock_dl.call_args[0][1] == "my-artifact"
 
 
-class TestSplitLogBySteps:
-    def _make_step(self, number, name, started_at, completed_at=None):
+def test_download_run_reusable_workflow_creates_per_step_files(monkeypatch, tmp_path):
+    mock_run_view = RunViewData(
+        databaseId=12345,
+        name="CI",
+        status="completed",
+        conclusion="success",
+        createdAt="2024-01-01T00:00:00Z",
+        displayTitle="Fix bug",
+        event="push",
+        headBranch="main",
+        headSha="abc123",
+        url="https://github.com/org/repo/actions/runs/12345",
+        workflowName="CI",
+        jobs=[
+            JobData(
+                databaseId=1,
+                name="test-job",
+                status="completed",
+                conclusion="success",
+                startedAt="2024-01-01T00:00:00Z",
+                completedAt="2024-01-01T00:01:00Z",
+            ),
+        ],
+    )
+    mock_wf_info = RunWorkflowInfo(
+        path=".github/workflows/ci.yml",
+        head_sha="abc123",
+        referenced_workflows=[
+            ReferencedWorkflow(path=".github/workflows/reusable.yml", sha="def456"),
+        ],
+    )
+
+    mock_steps = [
+        StepData(name="Checkout", status="completed", conclusion="success", number=1),
+        StepData(name="Build", status="completed", conclusion="success", number=2),
+    ]
+
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_view",
+        mock.Mock(return_value=mock_run_view),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_run_workflow_info",
+        mock.Mock(return_value=mock_wf_info),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_log_text",
+        mock.Mock(
+            return_value=(
+                "##[group]Run checkout\ncheckout output\n"
+                "##[group]Run make\nbuild output\n"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_job_steps",
+        mock.Mock(return_value=mock_steps),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.downloader.get_artifacts",
+        mock.Mock(return_value=[]),
+    )
+
+    download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path))
+
+    job_logs_dir = tmp_path / "12345" / "logs" / "test-job"
+    assert (job_logs_dir / "full.log").exists()
+    step_files = list(job_logs_dir.glob("*.txt"))
+    assert len(step_files) >= 1
+
+
+class TestSplitLogByGroups:
+    def _make_step(self, number, name, conclusion="success"):
         return StepData(
             name=name,
-            status="completed" if completed_at else "in_progress",
-            conclusion="success" if completed_at else None,
+            status="completed",
+            conclusion=conclusion,
             number=number,
-            startedAt=started_at,
-            completedAt=completed_at,
         )
 
     def test_normal_multi_step_log(self):
         steps = [
-            self._make_step(
-                1, "Checkout", "2024-01-15T12:00:00Z", "2024-01-15T12:00:10Z"
-            ),
-            self._make_step(2, "Build", "2024-01-15T12:00:10Z", "2024-01-15T12:01:00Z"),
-            self._make_step(3, "Test", "2024-01-15T12:01:00Z", "2024-01-15T12:02:00Z"),
+            self._make_step(1, "Set up Job"),
+            self._make_step(2, "Checkout"),
+            self._make_step(3, "Build"),
+            self._make_step(4, "Test"),
         ]
         log = (
-            "2024-01-15T12:00:00.0000000Z checkout line\n"
-            "2024-01-15T12:00:05.0000000Z another checkout line\n"
-            "2024-01-15T12:00:10.0000000Z build line\n"
-            "2024-01-15T12:01:00.0000000Z test line\n"
+            "2024-01-15T12:00:00Z ##[group]Set up job\n"
+            "setup output\n"
+            "2024-01-15T12:00:01Z ##[group]Run checkout\n"
+            "checkout output\n"
+            "2024-01-15T12:00:10Z ##[group]Run build\n"
+            "build output\n"
+            "2024-01-15T12:01:00Z ##[group]Run test\n"
+            "test output\n"
         )
-        result = _split_log_by_steps(log, steps)
-        assert "01_checkout" in result
-        assert "checkout line" in result["01_checkout"]
-        assert "02_build" in result
-        assert "build line" in result["02_build"]
-        assert "03_test" in result
-        assert "test line" in result["03_test"]
+        result = _split_log_by_groups(log, steps)
+        assert "setup output" in result["01_set-up-job"]
+        assert "checkout output" in result["02_checkout"]
+        assert "build output" in result["03_build"]
+        assert "test output" in result["04_test"]
 
-    def test_line_at_exact_step_start_boundary(self):
+    def test_lines_before_first_marker_go_to_first_step(self):
         steps = [
-            self._make_step(1, "Setup", "2024-01-15T12:00:00Z", "2024-01-15T12:00:30Z"),
-            self._make_step(2, "Run", "2024-01-15T12:00:30Z", "2024-01-15T12:01:00Z"),
-        ]
-        log = "2024-01-15T12:00:30.0000000Z boundary line\n"
-        result = _split_log_by_steps(log, steps)
-        assert "boundary line" in result["02_run"]
-
-    def test_final_step_with_completed_at_none(self):
-        steps = [
-            self._make_step(
-                1, "Checkout", "2024-01-15T12:00:00Z", "2024-01-15T12:00:10Z"
-            ),
-            self._make_step(2, "Build", "2024-01-15T12:00:10Z", None),
+            self._make_step(1, "Set up Job"),
+            self._make_step(2, "Checkout"),
+            self._make_step(3, "Build"),
         ]
         log = (
-            "2024-01-15T12:00:00.0000000Z checkout\n"
-            "2024-01-15T12:00:10.0000000Z build line 1\n"
-            "2024-01-15T12:05:00.0000000Z build line 2\n"
+            "2024-01-15T12:00:00Z setup line\n"
+            "2024-01-15T12:00:01Z another setup line\n"
+            "2024-01-15T12:00:02Z ##[group]Run checkout\n"
+            "checkout output\n"
+            "2024-01-15T12:00:10Z ##[group]Run build\n"
+            "build output\n"
         )
-        result = _split_log_by_steps(log, steps)
-        assert "build line 1" in result["02_build"]
-        assert "build line 2" in result["02_build"]
+        result = _split_log_by_groups(log, steps)
+        assert "setup line" in result["01_set-up-job"]
+        assert "another setup line" in result["01_set-up-job"]
+        assert "checkout output" in result["02_checkout"]
+        assert "build output" in result["03_build"]
 
-    def test_sub_second_timestamp_seven_fractional_digits(self):
+    def test_skipped_step_excluded_from_index(self):
         steps = [
-            self._make_step(1, "Run", "2024-01-15T12:34:56Z", "2024-01-15T12:35:00Z"),
+            self._make_step(1, "Set up Job"),
+            self._make_step(2, "Checkout"),
+            self._make_step(3, "Lint", conclusion="skipped"),
+            self._make_step(4, "Build"),
         ]
-        log = "2024-01-15T12:34:56.7654321Z sub-second line\n"
-        result = _split_log_by_steps(log, steps)
-        assert "sub-second line" in result["01_run"]
+        log = (
+            "2024-01-15T12:00:00Z ##[group]Set up job\n"
+            "setup output\n"
+            "2024-01-15T12:00:10Z ##[group]Run checkout\n"
+            "checkout output\n"
+            "2024-01-15T12:00:20Z ##[group]Run build\n"
+            "build output\n"
+        )
+        result = _split_log_by_groups(log, steps)
+        assert "03_lint" not in result
+        assert "setup output" in result["01_set-up-job"]
+        assert "checkout output" in result["02_checkout"]
+        assert "build output" in result["04_build"]
 
-    def test_no_matching_steps_all_lines_default(self):
+    def test_extra_markers_bucketed_to_last_step(self):
         steps = [
-            self._make_step(
-                1, "Checkout", "2024-01-15T12:00:00Z", "2024-01-15T12:00:10Z"
-            ),
+            self._make_step(1, "Set up Job"),
+            self._make_step(2, "Checkout"),
         ]
-        log = "2024-01-15T11:59:59.0000000Z early line\n"
-        result = _split_log_by_steps(log, steps)
-        assert "early line" in result["01_checkout"]
+        log = (
+            "2024-01-15T12:00:00Z ##[group]Set up job\n"
+            "setup output\n"
+            "2024-01-15T12:00:10Z ##[group]Run checkout\n"
+            "checkout output\n"
+            "2024-01-15T12:00:20Z ##[group]Run extra\n"
+            "extra output\n"
+        )
+        result = _split_log_by_groups(log, steps)
+        assert "extra output" in result["02_checkout"]
+
+    def test_runner_prefix_does_not_advance_index(self):
+        steps = [
+            self._make_step(1, "Set up Job"),
+            self._make_step(2, "Checkout"),
+            self._make_step(3, "Build"),
+        ]
+        log = (
+            "2024-01-15T12:00:00Z ##[group]Runner Image Provisioner\n"
+            "runner info\n"
+            "2024-01-15T12:00:05Z ##[group]Run checkout\n"
+            "checkout output\n"
+            "2024-01-15T12:00:10Z ##[group]Run build\n"
+            "build output\n"
+        )
+        result = _split_log_by_groups(log, steps)
+        assert "runner info" in result["01_set-up-job"]
+        assert "checkout output" in result["02_checkout"]
+        assert "build output" in result["03_build"]
+
+    def test_yaml_names_override_step_names(self):
+        steps = [
+            self._make_step(1, "Set up Job"),
+            self._make_step(2, "Run tests"),
+            self._make_step(3, "Build"),
+        ]
+        log = (
+            "2024-01-15T12:00:00Z ##[group]Set up job\n"
+            "setup output\n"
+            "2024-01-15T12:00:01Z ##[group]Run pytest\n"
+            "test output\n"
+            "2024-01-15T12:00:10Z ##[group]Run make\n"
+            "build output\n"
+        )
+        yaml_names = {2: "Integration Tests", 3: "Compile"}
+        result = _split_log_by_groups(log, steps, yaml_names)
+        assert "01_set-up-job" in result
+        assert "02_integration-tests" in result
+        assert "03_compile" in result
