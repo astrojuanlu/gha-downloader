@@ -20,7 +20,7 @@ dependencies = [
 license = "NOASSERTION"
 
 [project.scripts]
-gha-downloader = "gha_downloader.cli:main"
+gha-download = "gha_downloader.cli:main_download"
 
 [dependency-groups]
 dev = [

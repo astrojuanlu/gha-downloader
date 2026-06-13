@@ -13,14 +13,14 @@ uv tool install .
 During development, prefix commands with `uv run` instead:
 
 ```sh
-uv run gha-downloader run download ...
+uv run gha-download ...
 ```
 
 ## Usage
 
 ```sh
 $ gh auth login
-$ gha-downloader run download https://github.com/canonical/mysql-operators/actions/runs/27357958065
+$ gha-download https://github.com/canonical/mysql-operators/actions/runs/27357958065
 $ ls runs/27357958065/
 artifacts/  logs/  run.json
 ```
@@ -28,7 +28,7 @@ artifacts/  logs/  run.json
 The `--repo` is inferred from the URL. You can also use a numeric run ID:
 
 ```sh
-$ gha-downloader run download 27357958065 --repo canonical/mysql-operators
+$ gha-download 27357958065 --repo canonical/mysql-operators
 ```
 
 ### Prerequisites
@@ -49,7 +49,7 @@ For cross-repo downloads, pass `--repo ORG/REPO` explicitly.
 A URL containing `/job/ID` downloads only that one job, acting as an implicit `--job-id` filter:
 
 ```sh
-$ gha-downloader run download https://github.com/org/repo/actions/runs/27357958065/job/80847830020
+$ gha-download https://github.com/org/repo/actions/runs/27357958065/job/80847830020
 ```
 
 If you also pass `--job-id` explicitly and the values differ, a warning is printed and `--job-id` takes precedence:
@@ -63,7 +63,7 @@ URL query parameters (e.g. `?pr=354`) are stripped and have no effect.
 Filter by job ID manually:
 
 ```sh
-$ gha-downloader run download 27357958065 --job-id 80847830020
+$ gha-download 27357958065 --job-id 80847830020
 ```
 
 ### On-disk layout
@@ -84,15 +84,15 @@ runs/27357958065/
       .expired                      # marker for expired artifacts
 ```
 
-Step numbers may skip (skipped steps produce no file). `run download` is currently the only subcommand.
+Step numbers may skip (skipped steps produce no file).
 
 ### Flags
 
-`-v` / `-vv` must precede the subcommand: `gha-downloader -vv run download ...`
+`-v` / `-vv` can appear anywhere in the invocation.
 
 ```
-gha-downloader run download [-h] [--repo ORG/REPO] [--job-id JOB_ID]
-                            [--dir DIR] [--force] RUN_ID
+gha-download [-h] [--repo ORG/REPO] [--job-id JOB_ID]
+             [--dir DIR] [--force] [-v] RUN_ID
 ```
 
 | Flag       | Default  | Description                                          |
@@ -102,7 +102,7 @@ gha-downloader run download [-h] [--repo ORG/REPO] [--job-id JOB_ID]
 | `--job-id` | none     | Filter logs and artifacts by job ID                  |
 | `--dir`    | `./runs` | Root directory for downloads                         |
 | `--force`  | off      | Overwrite existing run directory                     |
-| `-v`       | 0        | Verbosity: `-v` INFO, `-vv` DEBUG (before subcmd)   |
+| `-v`       | 0        | Verbosity: `-v` INFO, `-vv` DEBUG                   |
 
 ### Exit codes
 
