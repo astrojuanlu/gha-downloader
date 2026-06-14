@@ -19,11 +19,18 @@ dependencies = [
 ]
 license = "NOASSERTION"
 
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.27.2",
+]
+
 [project.scripts]
 gha-download = "gha_downloader.cli:main_download"
+gha-downloader-mcp = "gha_downloader.mcp_server:main_mcp"
 
 [dependency-groups]
 dev = [
+    "mcp[cli]>=1.27.2",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.17",

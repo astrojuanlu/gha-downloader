@@ -114,6 +114,33 @@ gha-download [-h] [--repo ORG/REPO] [--job-id JOB_ID]
 | 3    | Network error    |
 | 130  | Interrupted      |
 
+## MCP Server
+
+An MCP server is available for AI agents to inspect GitHub Actions runs programmatically.
+
+### Invocation
+
+```sh
+gha-mcp-server
+```
+
+The server communicates over stdio using the MCP JSON-RPC protocol. Use it with any MCP-compatible client (e.g. Claude Desktop, opencode).
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_run_info` | Fetch run metadata and job list without downloading |
+| `list_artifacts` | List artifact names, sizes, and expiry status for a run |
+| `download_run` | Download all logs and artifacts for a run to disk |
+| `list_run_files` | Enumerate downloaded files for a run (logs + artifacts) |
+| `read_log` | Return the text content of a downloaded log file |
+| `read_artifact_file` | Return the text content of a file inside a downloaded artifact |
+
+### Prerequisites
+
+`gh auth login` must have been run beforehand with the `repo` read scope.
+
 ## Development
 
 ```sh

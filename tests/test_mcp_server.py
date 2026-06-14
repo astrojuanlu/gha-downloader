@@ -1,0 +1,305 @@
+from pathlib import Path
+from unittest import mock
+
+import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+
+from gha_downloader.downloader import DownloaderError
+from gha_downloader.gh import (
+    ArtifactData,
+    GhApiError,
+    GhNotFoundError,
+    JobData,
+    RunViewData,
+)
+from gha_downloader.mcp_server import (
+    _default_output_dir,
+    download_run,
+    get_run_info,
+    list_artifacts,
+    list_run_files,
+    read_artifact_file,
+    read_log,
+)
+
+
+def _make_run_view(
+    *,
+    jobs: list[JobData] | None = None,
+) -> RunViewData:
+    return RunViewData(
+        databaseId=12345,
+        name="CI",
+        status="completed",
+        conclusion="success",
+        createdAt="2024-01-01T00:00:00Z",
+        displayTitle="Fix bug",
+        event="push",
+        headBranch="main",
+        headSha="abc123",
+        url="https://github.com/org/repo/actions/runs/12345",
+        workflowName="CI",
+        jobs=jobs,
+    )
+
+
+class TestGetRunInfo:
+    def test_success(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=42,
+                    name="test-job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
+
+        result = get_run_info(12345, repo="org/repo")
+        assert result["databaseId"] == 12345
+        assert len(result["jobs"]) == 1
+
+    def test_not_found(self, monkeypatch):
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(side_effect=GhNotFoundError("not found")),
+        )
+
+        with pytest.raises(ToolError, match="not found"):
+            get_run_info(99999, repo="org/repo")
+
+    def test_api_error(self, monkeypatch):
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(side_effect=GhApiError("api error")),
+        )
+
+        with pytest.raises(ToolError, match="api error"):
+            get_run_info(12345, repo="org/repo")
+
+
+class TestListArtifacts:
+    def test_artifacts_present(self, monkeypatch):
+        art = ArtifactData.model_validate(
+            {"id": 100, "name": "my-artifact", "size_in_bytes": 2048, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo")
+        assert len(result) == 1
+        assert result[0]["name"] == "my-artifact"
+
+    def test_no_artifacts(self, monkeypatch):
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo")
+        assert result == []
+
+    def test_not_found_raises_tool_error(self, monkeypatch):
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(side_effect=GhNotFoundError("not found")),
+        )
+
+        with pytest.raises(ToolError, match="not found"):
+            list_artifacts(12345, repo="org/repo")
+
+    def test_expired_artifact_included(self, monkeypatch):
+        art = ArtifactData.model_validate(
+            {"id": 200, "name": "old-artifact", "size_in_bytes": 1024, "expired": True}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo")
+        assert result[0]["expired"] is True
+
+
+class TestDownloadRun:
+    def test_success(self, monkeypatch):
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server._download_run",
+            mock.Mock(),
+        )
+
+        result = download_run(12345, repo="org/repo")
+        assert "12345" in result
+
+    def test_directory_exists(self, monkeypatch):
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server._download_run",
+            mock.Mock(side_effect=DownloaderError("already exists")),
+        )
+
+        with pytest.raises(ToolError, match="already exists"):
+            download_run(12345, repo="org/repo")
+
+    def test_gh_error(self, monkeypatch):
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server._download_run",
+            mock.Mock(side_effect=GhNotFoundError("not found")),
+        )
+
+        with pytest.raises(ToolError, match="not found"):
+            download_run(12345, repo="org/repo")
+
+
+class TestListRunFiles:
+    def test_run_downloaded(self, tmp_path):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
+        (run_dir / "run.json").write_text("{}")
+        logs_dir = run_dir / "logs" / "test-job"
+        logs_dir.mkdir(parents=True)
+        (logs_dir / "full.log").write_text("log")
+        (logs_dir / "01_checkout.txt").write_text("step")
+        art_dir = run_dir / "artifacts" / "my-artifact"
+        art_dir.mkdir(parents=True)
+        (art_dir / "result.txt").write_text("data")
+
+        result = list_run_files(12345, output_dir=str(tmp_path))
+        lines = result.split("\n")
+        assert "run.json" in lines
+        assert any("full.log" in line for line in lines)
+        assert any("result.txt" in line for line in lines)
+
+    def test_run_not_downloaded(self, tmp_path):
+        with pytest.raises(ToolError, match="does not exist"):
+            list_run_files(99999, output_dir=str(tmp_path))
+
+
+class TestReadLog:
+    def test_list_job_slugs(self, tmp_path):
+        run_dir = tmp_path / "12345" / "logs"
+        (run_dir / "build-job").mkdir(parents=True)
+        (run_dir / "test-job").mkdir(parents=True)
+
+        result = read_log(12345, output_dir=str(tmp_path))
+        assert "build-job" in result
+        assert "test-job" in result
+
+    def test_read_full_log(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "test-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("full log content")
+
+        result = read_log(12345, output_dir=str(tmp_path), job_slug="test-job")
+        assert result == "full log content"
+
+    def test_read_step_log(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "test-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "01_checkout.txt").write_text("checkout output")
+
+        result = read_log(
+            12345,
+            output_dir=str(tmp_path),
+            job_slug="test-job",
+            step_label="01_checkout",
+        )
+        assert result == "checkout output"
+
+    def test_unknown_job_slug(self, tmp_path):
+        run_dir = tmp_path / "12345" / "logs"
+        (run_dir / "build-job").mkdir(parents=True)
+
+        with pytest.raises(ToolError, match="not found"):
+            read_log(12345, output_dir=str(tmp_path), job_slug="missing-job")
+
+    def test_unknown_step_label(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "test-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "01_checkout.txt").write_text("checkout")
+
+        with pytest.raises(ToolError, match="not found"):
+            read_log(
+                12345,
+                output_dir=str(tmp_path),
+                job_slug="test-job",
+                step_label="99_missing",
+            )
+
+    def test_no_logs_directory(self, tmp_path):
+        with pytest.raises(ToolError, match="No logs directory"):
+            read_log(12345, output_dir=str(tmp_path))
+
+
+class TestReadArtifactFile:
+    def test_read_text_file(self, tmp_path):
+        art_dir = tmp_path / "12345" / "artifacts" / "my-artifact"
+        art_dir.mkdir(parents=True)
+        (art_dir / "result.txt").write_text("artifact data", encoding="utf-8")
+
+        result = read_artifact_file(
+            12345,
+            artifact_slug="my-artifact",
+            file_path="result.txt",
+            output_dir=str(tmp_path),
+        )
+        assert result == "artifact data"
+
+    def test_binary_file(self, tmp_path):
+        art_dir = tmp_path / "12345" / "artifacts" / "my-artifact"
+        art_dir.mkdir(parents=True)
+        (art_dir / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        with pytest.raises(ToolError, match="binary"):
+            read_artifact_file(
+                12345,
+                artifact_slug="my-artifact",
+                file_path="image.png",
+                output_dir=str(tmp_path),
+            )
+
+    def test_artifact_not_found(self, tmp_path):
+        run_dir = tmp_path / "12345" / "artifacts"
+        run_dir.mkdir(parents=True)
+
+        with pytest.raises(ToolError, match="not found"):
+            read_artifact_file(
+                12345,
+                artifact_slug="missing-artifact",
+                file_path="result.txt",
+                output_dir=str(tmp_path),
+            )
+
+    def test_file_not_found_in_artifact(self, tmp_path):
+        art_dir = tmp_path / "12345" / "artifacts" / "my-artifact"
+        art_dir.mkdir(parents=True)
+        (art_dir / "other.txt").write_text("data")
+
+        with pytest.raises(ToolError, match="not found"):
+            read_artifact_file(
+                12345,
+                artifact_slug="my-artifact",
+                file_path="missing.txt",
+                output_dir=str(tmp_path),
+            )
+
+
+class TestDefaultOutputDir:
+    def test_xdg_data_home_set(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+        result = _default_output_dir()
+        assert result == str(tmp_path / "gha-downloader" / "runs")
+
+    def test_xdg_data_home_not_set(self, monkeypatch):
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        result = _default_output_dir()
+        expected = str(Path.home() / ".local" / "share" / "gha-downloader" / "runs")
+        assert result == expected
