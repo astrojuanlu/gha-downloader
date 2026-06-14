@@ -4,7 +4,6 @@ from unittest import mock
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from gha_downloader.downloader import DownloaderError
 from gha_downloader.gh import (
     ArtifactData,
     GhApiError,
@@ -18,9 +17,9 @@ from gha_downloader.mcp_server import (
     download_run,
     get_run_info,
     list_artifacts,
+    list_logs,
     list_run_files,
     read_artifact_file,
-    read_log,
     search_log,
 )
 
@@ -141,15 +140,26 @@ class TestDownloadRun:
 
         result = download_run(12345, repo="org/repo")
         assert "12345" in result
+        assert "cached" not in result
 
-    def test_directory_exists(self, monkeypatch):
+    def test_cached_directory(self, tmp_path):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
+
+        result = download_run(12345, output_dir=str(tmp_path))
+        assert "12345" in result
+        assert "cached" in result
+
+    def test_force_redownload(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
         monkeypatch.setattr(
             "gha_downloader.mcp_server._download_run",
-            mock.Mock(side_effect=DownloaderError("already exists")),
+            mock.Mock(),
         )
 
-        with pytest.raises(ToolError, match="already exists"):
-            download_run(12345, repo="org/repo")
+        result = download_run(12345, output_dir=str(tmp_path), force=True)
+        assert "cached" not in result
 
     def test_gh_error(self, monkeypatch):
         monkeypatch.setattr(
@@ -185,60 +195,32 @@ class TestListRunFiles:
             list_run_files(99999, output_dir=str(tmp_path))
 
 
-class TestReadLog:
+class TestListLogs:
     def test_list_job_slugs(self, tmp_path):
         run_dir = tmp_path / "12345" / "logs"
         (run_dir / "build-job").mkdir(parents=True)
         (run_dir / "test-job").mkdir(parents=True)
 
-        result = read_log(12345, output_dir=str(tmp_path))
+        result = list_logs(12345, output_dir=str(tmp_path))
         assert "build-job" in result
         assert "test-job" in result
 
-    def test_read_full_log(self, tmp_path):
-        job_dir = tmp_path / "12345" / "logs" / "test-job"
-        job_dir.mkdir(parents=True)
-        (job_dir / "full.log").write_text("full log content")
+    def test_step_labels_in_listing(self, tmp_path):
+        run_dir = tmp_path / "12345" / "logs" / "build-job"
+        run_dir.mkdir(parents=True)
+        (run_dir / "01_checkout.txt").write_text("checkout output")
+        (run_dir / "02_build.txt").write_text("build output")
+        (run_dir / "full.log").write_text("full log")
 
-        result = read_log(12345, output_dir=str(tmp_path), job_slug="test-job")
-        assert result == "full log content"
-
-    def test_read_step_log(self, tmp_path):
-        job_dir = tmp_path / "12345" / "logs" / "test-job"
-        job_dir.mkdir(parents=True)
-        (job_dir / "01_checkout.txt").write_text("checkout output")
-
-        result = read_log(
-            12345,
-            output_dir=str(tmp_path),
-            job_slug="test-job",
-            step_label="01_checkout",
-        )
-        assert result == "checkout output"
-
-    def test_unknown_job_slug(self, tmp_path):
-        run_dir = tmp_path / "12345" / "logs"
-        (run_dir / "build-job").mkdir(parents=True)
-
-        with pytest.raises(ToolError, match="not found"):
-            read_log(12345, output_dir=str(tmp_path), job_slug="missing-job")
-
-    def test_unknown_step_label(self, tmp_path):
-        job_dir = tmp_path / "12345" / "logs" / "test-job"
-        job_dir.mkdir(parents=True)
-        (job_dir / "01_checkout.txt").write_text("checkout")
-
-        with pytest.raises(ToolError, match="not found"):
-            read_log(
-                12345,
-                output_dir=str(tmp_path),
-                job_slug="test-job",
-                step_label="99_missing",
-            )
+        result = list_logs(12345, output_dir=str(tmp_path))
+        assert "build-job" in result
+        assert "steps:" in result
+        assert "01_checkout" in result
+        assert "02_build" in result
 
     def test_no_logs_directory(self, tmp_path):
         with pytest.raises(ToolError, match="No logs directory"):
-            read_log(12345, output_dir=str(tmp_path))
+            list_logs(12345, output_dir=str(tmp_path))
 
 
 class TestReadArtifactFile:
@@ -379,20 +361,67 @@ class TestGetRunInfoJobSlug:
         assert "steps" in result["jobs"][0]
         assert result["jobs"][0]["steps"][0]["name"] == "checkout"
 
+    def test_step_label_injected(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=42,
+                    name="test-job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                    steps=[
+                        StepData(
+                            name="Run Tests",
+                            status="completed",
+                            conclusion="success",
+                            number=7,
+                            startedAt="2024-01-01T00:00:00Z",
+                            completedAt="2024-01-01T00:00:30Z",
+                        )
+                    ],
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
 
-class TestReadLogStepLabels:
-    def test_step_labels_in_listing(self, tmp_path):
-        run_dir = tmp_path / "12345" / "logs" / "build-job"
-        run_dir.mkdir(parents=True)
-        (run_dir / "01_checkout.txt").write_text("checkout output")
-        (run_dir / "02_build.txt").write_text("build output")
-        (run_dir / "full.log").write_text("full log")
+        result = get_run_info(12345, repo="org/repo", include_steps=True)
+        assert result["jobs"][0]["steps"][0]["step_label"] == "07_run-tests"
 
-        result = read_log(12345, output_dir=str(tmp_path))
-        assert "build-job" in result
-        assert "steps:" in result
-        assert "01_checkout" in result
-        assert "02_build" in result
+    def test_skipped_steps_no_label(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=42,
+                    name="test-job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                    steps=[
+                        StepData(
+                            name="optional-step",
+                            status="completed",
+                            conclusion="skipped",
+                            number=2,
+                            startedAt="2024-01-01T00:00:00Z",
+                            completedAt="2024-01-01T00:00:30Z",
+                        )
+                    ],
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
+
+        result = get_run_info(12345, repo="org/repo", include_steps=True)
+        assert "step_label" not in result["jobs"][0]["steps"][0]
 
 
 class TestSearchLog:

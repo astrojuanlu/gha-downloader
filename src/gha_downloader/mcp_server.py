@@ -24,8 +24,10 @@ mcp = FastMCP(
         "1. get_run_info — identify job names, IDs, and slugs\n"
         "2. download_run(job_id=<id>) — download only that job's logs "
         "(faster, avoids timeouts on large runs)\n"
-        "3. read_log(run_id=<id>) — list available job slugs with steps\n"
-        "4. read_log(run_id=<id>, job_slug=<slug>) — read the log\n"
+        "3. list_logs(run_id=<id>) — list available job slugs with steps\n"
+        "4. Read log content using native file-read tools at "
+        "<run_dir>/logs/<job_slug>/full.log or "
+        "<run_dir>/logs/<job_slug>/<step_label>.txt\n"
         "\n"
         "To find errors in large logs without reading them in full, "
         "use search_log as the first step.\n"
@@ -44,7 +46,7 @@ _ANN_READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
 )
 _ANN_DESTRUCTIVE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
 )
 _ANN_LOCAL_READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
@@ -58,15 +60,23 @@ def get_run_info(
     """Get metadata for a GitHub Actions run without downloading files.
 
     Each job entry includes a ``job_slug`` field (the filesystem-safe
-    slug derived from the job display name) for use with ``read_log``.
+    slug derived from the job display name) for use with ``list_logs``
+    and ``search_log``.
+
+    When ``include_steps=True``, each non-skipped step includes a
+    ``step_label`` field matching the ``step_label`` accepted by
+    ``search_log``. Note: ``step_label`` values are computed from the
+    GitHub API step name and may differ from on-disk filenames when
+    workflow YAML name overrides are used. Call ``list_logs`` for
+    authoritative on-disk step labels.
 
     Args:
         run_id: Numeric workflow run ID.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
             inside a git clone.
         include_steps: When ``True``, include per-step detail in each
-            job entry. Default ``False`` omits steps to keep the
-            response compact.
+            job entry (with ``step_label`` on non-skipped steps).
+            Default ``False`` omits steps to keep the response compact.
 
     Returns:
         Dict with run ID, name, status, conclusion, branch, commit SHA,
@@ -82,6 +92,12 @@ def get_run_info(
         result = data.model_dump(mode="json")
         for job in result["jobs"]:
             job["job_slug"] = slugify(job["name"])
+            if include_steps and job.get("steps"):
+                for step in job["steps"]:
+                    if step.get("conclusion") != "skipped":
+                        step["step_label"] = (
+                            f"{step['number']:02d}_{slugify(step['name'])}"
+                        )
             if not include_steps:
                 job.pop("steps", None)
         return result
@@ -132,6 +148,9 @@ def download_run(
     and artifacts, which is significantly faster and avoids timeouts
     on large runs. Without ``job_id``, all jobs are downloaded.
 
+    When the run directory already exists and ``force`` is ``False``,
+    returns the cached path immediately without re-downloading.
+
     Args:
         run_id: Numeric workflow run ID.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
@@ -143,15 +162,18 @@ def download_run(
         force: Overwrite existing run directory if it already exists.
 
     Returns:
-        The absolute path of the run directory on success.
+        The absolute path of the run directory on success. Appends
+        ``(cached)`` when the directory already existed.
 
     Raises:
-        ToolError: If the run directory already exists (unless
-            ``force`` is True), or the run is not found, or the repo
-            cannot be auto-detected.
+        ToolError: If the run is not found or the repo cannot be
+            auto-detected.
     """
     if output_dir is None:
         output_dir = _default_output_dir()
+    run_dir = Path(output_dir) / str(run_id)
+    if run_dir.is_dir() and not force:
+        return f"{run_dir.resolve()} (cached)"
     try:
         _download_run(
             run_id=run_id,
@@ -211,39 +233,26 @@ def list_run_files(run_id: int, output_dir: str | None = None) -> str:
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
-def read_log(
-    run_id: int,
-    output_dir: str | None = None,
-    job_slug: str | None = None,
-    step_label: str | None = None,
-) -> str:
-    """Read the text content of a downloaded log file.
+def list_logs(run_id: int, output_dir: str | None = None) -> str:
+    """List downloaded job logs for a run, showing slugs and step labels.
 
-    The ``job_slug`` parameter is a filesystem-safe slug derived from
-    the job's display name — it is NOT a numeric job ID. If you do
-    not know the slug, call ``read_log`` without ``job_slug`` first
-    to list the available slug names.
+    Returns a discovery listing of job slugs and their available step
+    labels. Does not return log file content — use native file-read
+    tools with the path from ``download_run`` to read log files.
 
     Args:
         run_id: Numeric workflow run ID.
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
-        job_slug: Filesystem-safe slug of the job (not a numeric ID).
-            When omitted, lists available slugs with step labels.
-        step_label: Step label within the job log. When omitted,
-            returns the full job log.
 
     Returns:
-        When only ``run_id`` is given, each job slug followed by an
-        indented line listing its available step labels. When
-        ``job_slug`` is given without ``step_label``, the full job
-        log text. When both are given, the step log text.
+        Each job slug followed by an indented line listing its
+        available step labels.
 
     Raises:
-        ToolError: If the run has not been downloaded, the job slug
-        or step label is not found, or a numeric job ID was passed
-        as ``job_slug``.
+        ToolError: If the run has not been downloaded or no job logs
+            are found.
     """
     if output_dir is None:
         output_dir = _default_output_dir()
@@ -256,45 +265,20 @@ def read_log(
             "Download the run first with download_run."
         )
 
-    if job_slug is None:
-        slugs = sorted(d.name for d in logs_dir.iterdir() if d.is_dir())
-        if not slugs:
-            raise ToolError(f"No job logs found for run {run_id}.")
-        lines: list[str] = []
-        for s in slugs:
-            lines.append(s)
-            step_files = sorted(
-                p.stem
-                for p in (logs_dir / s).iterdir()
-                if p.is_file() and p.suffix == ".txt"
-            )
-            if step_files:
-                lines.append(f"  steps: {', '.join(step_files)}")
-        return "\n".join(lines)
-
-    job_dir = logs_dir / job_slug
-    if not job_dir.is_dir():
-        available = sorted(d.name for d in logs_dir.iterdir() if d.is_dir())
-        raise ToolError(
-            f"Job slug '{job_slug}' not found. Available: {', '.join(available)}"
+    slugs = sorted(d.name for d in logs_dir.iterdir() if d.is_dir())
+    if not slugs:
+        raise ToolError(f"No job logs found for run {run_id}.")
+    lines: list[str] = []
+    for s in slugs:
+        lines.append(s)
+        step_files = sorted(
+            p.stem
+            for p in (logs_dir / s).iterdir()
+            if p.is_file() and p.suffix == ".txt"
         )
-
-    if step_label is None:
-        full_log = job_dir / "full.log"
-        if not full_log.is_file():
-            raise ToolError(f"full.log not found for job '{job_slug}'.")
-        return full_log.read_text()
-
-    step_file = job_dir / f"{step_label}.txt"
-    if not step_file.is_file():
-        available = sorted(
-            p.stem for p in job_dir.iterdir() if p.is_file() and p.suffix == ".txt"
-        )
-        raise ToolError(
-            f"Step '{step_label}' not found for job '{job_slug}'. "
-            f"Available steps: {', '.join(available)}"
-        )
-    return step_file.read_text()
+        if step_files:
+            lines.append(f"  steps: {', '.join(step_files)}")
+    return "\n".join(lines)
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
