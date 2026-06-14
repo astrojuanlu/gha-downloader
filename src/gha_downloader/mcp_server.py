@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -12,7 +13,7 @@ except ImportError as exc:
 
 import structlog
 
-from .downloader import DownloaderError
+from .downloader import DownloaderError, slugify
 from .downloader import download_run as _download_run
 from .gh import GhError, GhNotFoundError, get_artifacts, get_run_view
 
@@ -20,11 +21,14 @@ mcp = FastMCP(
     "gha-downloader",
     instructions=(
         "Workflow for investigating a specific job:\n"
-        "1. get_run_info — identify job names and IDs\n"
+        "1. get_run_info — identify job names, IDs, and slugs\n"
         "2. download_run(job_id=<id>) — download only that job's logs "
         "(faster, avoids timeouts on large runs)\n"
-        "3. read_log(run_id=<id>) — list available job slugs\n"
+        "3. read_log(run_id=<id>) — list available job slugs with steps\n"
         "4. read_log(run_id=<id>, job_slug=<slug>) — read the log\n"
+        "\n"
+        "To find errors in large logs without reading them in full, "
+        "use search_log as the first step.\n"
         "\n"
         "Other tools: list_artifacts, list_run_files, read_artifact_file."
     ),
@@ -48,20 +52,26 @@ _ANN_LOCAL_READ_ONLY = ToolAnnotations(
 
 
 @mcp.tool(annotations=_ANN_READ_ONLY)
-def get_run_info(run_id: int, repo: str | None = None) -> dict:
+def get_run_info(
+    run_id: int, repo: str | None = None, include_steps: bool = False
+) -> dict:
     """Get metadata for a GitHub Actions run without downloading files.
 
-    Each job's ``name`` field is the display name from which the
-    ``job_slug`` used by ``read_log`` is derived.
+    Each job entry includes a ``job_slug`` field (the filesystem-safe
+    slug derived from the job display name) for use with ``read_log``.
 
     Args:
         run_id: Numeric workflow run ID.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
             inside a git clone.
+        include_steps: When ``True``, include per-step detail in each
+            job entry. Default ``False`` omits steps to keep the
+            response compact.
 
     Returns:
         Dict with run ID, name, status, conclusion, branch, commit SHA,
-        trigger event, workflow name, URL, and a list of jobs.
+        trigger event, workflow name, URL, and a list of jobs (each
+        with ``job_slug``; steps only when ``include_steps=True``).
 
     Raises:
         ToolError: If the run is not found or the repo cannot be
@@ -69,7 +79,12 @@ def get_run_info(run_id: int, repo: str | None = None) -> dict:
     """
     try:
         data = get_run_view(str(run_id), repo=repo)
-        return data.model_dump(mode="json")
+        result = data.model_dump(mode="json")
+        for job in result["jobs"]:
+            job["job_slug"] = slugify(job["name"])
+            if not include_steps:
+                job.pop("steps", None)
+        return result
     except GhError as exc:
         raise ToolError(str(exc)) from exc
     except DownloaderError as exc:
@@ -215,15 +230,15 @@ def read_log(
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
         job_slug: Filesystem-safe slug of the job (not a numeric ID).
-            When omitted, lists available slugs.
+            When omitted, lists available slugs with step labels.
         step_label: Step label within the job log. When omitted,
             returns the full job log.
 
     Returns:
-        When only ``run_id`` is given, newline-separated list of
-        available job slugs. When ``job_slug`` is given without
-        ``step_label``, the full job log text. When both are given,
-        the step log text.
+        When only ``run_id`` is given, each job slug followed by an
+        indented line listing its available step labels. When
+        ``job_slug`` is given without ``step_label``, the full job
+        log text. When both are given, the step log text.
 
     Raises:
         ToolError: If the run has not been downloaded, the job slug
@@ -245,7 +260,17 @@ def read_log(
         slugs = sorted(d.name for d in logs_dir.iterdir() if d.is_dir())
         if not slugs:
             raise ToolError(f"No job logs found for run {run_id}.")
-        return "\n".join(slugs)
+        lines: list[str] = []
+        for s in slugs:
+            lines.append(s)
+            step_files = sorted(
+                p.stem
+                for p in (logs_dir / s).iterdir()
+                if p.is_file() and p.suffix == ".txt"
+            )
+            if step_files:
+                lines.append(f"  steps: {', '.join(step_files)}")
+        return "\n".join(lines)
 
     job_dir = logs_dir / job_slug
     if not job_dir.is_dir():
@@ -331,6 +356,96 @@ def read_artifact_file(
         raise ToolError(
             f"File '{file_path}' is binary and cannot be returned as text."
         ) from None
+
+
+@mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
+def search_log(  # noqa: PLR0913, PLR0912
+    run_id: int,
+    pattern: str,
+    job_slug: str | None = None,
+    step_label: str | None = None,
+    output_dir: str | None = None,
+    context_lines: int = 0,
+) -> str:
+    """Search downloaded log content for lines matching a regex pattern.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        pattern: Regular expression pattern to search for.
+        job_slug: Filesystem-safe slug of the job to search. When
+            omitted, searches all job logs.
+        step_label: Step label within the job. When omitted with
+            ``job_slug``, searches ``full.log`` for that job.
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+        context_lines: Number of lines before and after each match
+            to include (default 0).
+
+    Returns:
+        Matching lines formatted as ``<job_slug>:<line_number>: <line>``,
+        grouped by job with blank-line separators. Returns
+        ``No matches found.`` when no lines match.
+
+    Raises:
+        ToolError: If the regex pattern is invalid, the run has not
+            been downloaded, or the specified job or step is not found.
+    """
+    try:
+        compiled = re.compile(pattern)
+    except re.error as exc:
+        raise ToolError(f"Invalid regex '{pattern}': {exc}") from exc
+
+    if output_dir is None:
+        output_dir = _default_output_dir()
+    run_dir = Path(output_dir) / str(run_id)
+    logs_dir = run_dir / "logs"
+
+    if not logs_dir.is_dir():
+        raise ToolError(
+            f"No logs directory for run {run_id}. "
+            "Download the run first with download_run."
+        )
+
+    if job_slug is not None and step_label is not None:
+        target = logs_dir / job_slug / f"{step_label}.txt"
+        if not target.is_file():
+            raise ToolError(
+                f"Step file '{step_label}.txt' not found for job "
+                f"'{job_slug}' in run {run_id}."
+            )
+        targets: list[tuple[str, Path]] = [(job_slug, target)]
+    elif job_slug is not None:
+        target = logs_dir / job_slug / "full.log"
+        if not target.is_file():
+            raise ToolError(f"full.log not found for job '{job_slug}' in run {run_id}.")
+        targets = [(job_slug, target)]
+    else:
+        targets = sorted(
+            (d.name, d / "full.log")
+            for d in logs_dir.iterdir()
+            if d.is_dir() and (d / "full.log").is_file()
+        )
+        if not targets:
+            raise ToolError(f"No job logs found for run {run_id}.")
+
+    groups: list[str] = []
+    for slug, path in targets:
+        lines = path.read_text().splitlines()
+        matches: list[str] = []
+        for i, line in enumerate(lines):
+            if compiled.search(line):
+                start = max(0, i - context_lines)
+                end = min(len(lines), i + context_lines + 1)
+                for j in range(start, end):
+                    matches.append(f"{slug}:{j + 1}: {lines[j]}")
+        if matches:
+            groups.append("\n".join(matches))
+
+    if not groups:
+        return "No matches found."
+
+    return "\n\n".join(groups)
 
 
 def main_mcp() -> None:

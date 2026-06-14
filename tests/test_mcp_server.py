@@ -11,6 +11,7 @@ from gha_downloader.gh import (
     GhNotFoundError,
     JobData,
     RunViewData,
+    StepData,
 )
 from gha_downloader.mcp_server import (
     _default_output_dir,
@@ -20,6 +21,7 @@ from gha_downloader.mcp_server import (
     list_run_files,
     read_artifact_file,
     read_log,
+    search_log,
 )
 
 
@@ -292,7 +294,148 @@ class TestReadArtifactFile:
             )
 
 
-class TestDefaultOutputDir:
+class TestGetRunInfoJobSlug:
+    def test_job_slug_present(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=42,
+                    name="Test Job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
+
+        result = get_run_info(12345, repo="org/repo")
+        assert result["jobs"][0]["job_slug"] == "test-job"
+
+    def test_steps_absent_by_default(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=42,
+                    name="test-job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                    steps=[
+                        StepData(
+                            name="checkout",
+                            status="completed",
+                            conclusion="success",
+                            number=1,
+                            startedAt="2024-01-01T00:00:00Z",
+                            completedAt="2024-01-01T00:00:30Z",
+                        )
+                    ],
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
+
+        result = get_run_info(12345, repo="org/repo")
+        assert "steps" not in result["jobs"][0]
+
+    def test_steps_present_when_include_steps(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=42,
+                    name="test-job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                    steps=[
+                        StepData(
+                            name="checkout",
+                            status="completed",
+                            conclusion="success",
+                            number=1,
+                            startedAt="2024-01-01T00:00:00Z",
+                            completedAt="2024-01-01T00:00:30Z",
+                        )
+                    ],
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
+
+        result = get_run_info(12345, repo="org/repo", include_steps=True)
+        assert "steps" in result["jobs"][0]
+        assert result["jobs"][0]["steps"][0]["name"] == "checkout"
+
+
+class TestReadLogStepLabels:
+    def test_step_labels_in_listing(self, tmp_path):
+        run_dir = tmp_path / "12345" / "logs" / "build-job"
+        run_dir.mkdir(parents=True)
+        (run_dir / "01_checkout.txt").write_text("checkout output")
+        (run_dir / "02_build.txt").write_text("build output")
+        (run_dir / "full.log").write_text("full log")
+
+        result = read_log(12345, output_dir=str(tmp_path))
+        assert "build-job" in result
+        assert "steps:" in result
+        assert "01_checkout" in result
+        assert "02_build" in result
+
+
+class TestSearchLog:
+    def test_matching_lines(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("ok\nError: failed\nok\n")
+
+        result = search_log(12345, "Error", output_dir=str(tmp_path))
+        assert "build-job:2:" in result
+        assert "Error: failed" in result
+
+    def test_no_matches(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("all good\n")
+
+        result = search_log(12345, "Error", output_dir=str(tmp_path))
+        assert result == "No matches found."
+
+    def test_invalid_regex(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("log\n")
+
+        with pytest.raises(ToolError, match="Invalid regex"):
+            search_log(12345, "[invalid", output_dir=str(tmp_path))
+
+    def test_context_lines(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("line1\nline2\nError here\nline4\nline5\n")
+
+        result = search_log(12345, "Error", output_dir=str(tmp_path), context_lines=1)
+        lines = result.split("\n")
+        assert any("build-job:2:" in line for line in lines)
+        assert any("build-job:3:" in line for line in lines)
+        assert any("build-job:4:" in line for line in lines)
+
+    def test_run_not_downloaded(self, tmp_path):
+        with pytest.raises(ToolError, match="No logs directory"):
+            search_log(99999, "Error", output_dir=str(tmp_path))
+
     def test_xdg_data_home_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
         result = _default_output_dir()
