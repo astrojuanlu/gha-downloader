@@ -19,12 +19,14 @@ from .gh import GhError, GhNotFoundError, get_artifacts, get_run_view
 mcp = FastMCP(
     "gha-downloader",
     instructions=(
-        "MCP server for inspecting GitHub Actions runs. "
-        "Use get_run_info to fetch metadata, list_artifacts to see artifacts, "
-        "download_run to save logs/artifacts to disk, "
-        "list_run_files to enumerate downloaded files, "
-        "read_log to read log content, "
-        "read_artifact_file to read artifact file content."
+        "Workflow for investigating a specific job:\n"
+        "1. get_run_info — identify job names and IDs\n"
+        "2. download_run(job_id=<id>) — download only that job's logs "
+        "(faster, avoids timeouts on large runs)\n"
+        "3. read_log(run_id=<id>) — list available job slugs\n"
+        "4. read_log(run_id=<id>, job_slug=<slug>) — read the log\n"
+        "\n"
+        "Other tools: list_artifacts, list_run_files, read_artifact_file."
     ),
 )
 
@@ -49,8 +51,21 @@ _ANN_LOCAL_READ_ONLY = ToolAnnotations(
 def get_run_info(run_id: int, repo: str | None = None) -> dict:
     """Get metadata for a GitHub Actions run without downloading files.
 
-    Returns run ID, name, status, conclusion, branch, commit SHA,
-    trigger event, workflow name, URL, and a list of jobs.
+    Each job's ``name`` field is the display name from which the
+    ``job_slug`` used by ``read_log`` is derived.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        repo: Repository in ORG/REPO format. Auto-detected if omitted
+            inside a git clone.
+
+    Returns:
+        Dict with run ID, name, status, conclusion, branch, commit SHA,
+        trigger event, workflow name, URL, and a list of jobs.
+
+    Raises:
+        ToolError: If the run is not found or the repo cannot be
+            auto-detected.
     """
     try:
         data = get_run_view(str(run_id), repo=repo)
@@ -65,8 +80,19 @@ def get_run_info(run_id: int, repo: str | None = None) -> dict:
 def list_artifacts(run_id: int, repo: str | None = None) -> list[dict]:
     """List artifacts for a GitHub Actions run without downloading them.
 
-    Returns a list of artifact records with id, name, size_in_bytes,
-    and expired fields.
+    Args:
+        run_id: Numeric workflow run ID.
+        repo: Repository in ORG/REPO format. Auto-detected if omitted
+            inside a git clone.
+
+    Returns:
+        List of artifact records with id, name, size_in_bytes, and
+        expired fields. Returns an empty list if the run has no
+        artifacts.
+
+    Raises:
+        ToolError: If the run is not found or the repo cannot be
+            auto-detected.
     """
     try:
         artifacts = get_artifacts(str(run_id), repo=repo)
@@ -85,9 +111,29 @@ def download_run(
     output_dir: str | None = None,
     force: bool = False,
 ) -> str:
-    """Download all logs and artifacts for a GitHub Actions run.
+    """Download logs and artifacts for a GitHub Actions run.
 
-    Returns the absolute path of the run directory on success.
+    Passing ``job_id`` restricts the download to a single job's logs
+    and artifacts, which is significantly faster and avoids timeouts
+    on large runs. Without ``job_id``, all jobs are downloaded.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        repo: Repository in ORG/REPO format. Auto-detected if omitted
+            inside a git clone.
+        job_id: Only download logs and artifacts for this job ID.
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+        force: Overwrite existing run directory if it already exists.
+
+    Returns:
+        The absolute path of the run directory on success.
+
+    Raises:
+        ToolError: If the run directory already exists (unless
+            ``force`` is True), or the run is not found, or the repo
+            cannot be auto-detected.
     """
     if output_dir is None:
         output_dir = _default_output_dir()
@@ -110,8 +156,19 @@ def download_run(
 def list_run_files(run_id: int, output_dir: str | None = None) -> str:
     """Enumerate downloaded files for a run (logs and artifacts).
 
-    Returns newline-separated relative paths of all files under the run
-    directory.
+    Args:
+        run_id: Numeric workflow run ID.
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+
+    Returns:
+        Newline-separated relative paths of all files under the run
+        directory.
+
+    Raises:
+        ToolError: If the run directory does not exist (run not
+            downloaded yet).
     """
     if output_dir is None:
         output_dir = _default_output_dir()
@@ -147,9 +204,31 @@ def read_log(
 ) -> str:
     """Read the text content of a downloaded log file.
 
-    When only run_id is given, returns the list of available job slugs.
-    When job_slug is given without step_label, returns the full job log.
-    When both job_slug and step_label are given, returns the step log.
+    The ``job_slug`` parameter is a filesystem-safe slug derived from
+    the job's display name — it is NOT a numeric job ID. If you do
+    not know the slug, call ``read_log`` without ``job_slug`` first
+    to list the available slug names.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+        job_slug: Filesystem-safe slug of the job (not a numeric ID).
+            When omitted, lists available slugs.
+        step_label: Step label within the job log. When omitted,
+            returns the full job log.
+
+    Returns:
+        When only ``run_id`` is given, newline-separated list of
+        available job slugs. When ``job_slug`` is given without
+        ``step_label``, the full job log text. When both are given,
+        the step log text.
+
+    Raises:
+        ToolError: If the run has not been downloaded, the job slug
+        or step label is not found, or a numeric job ID was passed
+        as ``job_slug``.
     """
     if output_dir is None:
         output_dir = _default_output_dir()
@@ -202,7 +281,23 @@ def read_artifact_file(
 ) -> str:
     """Read the text content of a file inside a downloaded artifact directory.
 
-    Returns the file content as UTF-8 text. Returns an error for binary files.
+    Args:
+        run_id: Numeric workflow run ID.
+        artifact_slug: Slug of the artifact directory (derived from
+            the artifact name).
+        file_path: Relative path of the file within the artifact
+            directory.
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+
+    Returns:
+        The file content as UTF-8 text.
+
+    Raises:
+        ToolError: If the artifact directory does not exist, the file
+        is not found, or the file is binary and cannot be returned as
+        text.
     """
     if output_dir is None:
         output_dir = _default_output_dir()
