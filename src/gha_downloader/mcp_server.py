@@ -73,9 +73,11 @@ def get_run_info(
     workflow YAML name overrides are used. Call ``list_logs`` for
     authoritative on-disk step labels.
 
-    When ``only_failed=True``, only jobs whose conclusion is not
-    ``"success"`` are returned. This is useful for large matrix runs
-    where most jobs pass and you only want to inspect failures.
+    When ``only_failed=True``, only jobs whose conclusion is neither
+    ``"success"`` nor ``"skipped"`` are returned. Jobs still in
+    progress (``conclusion`` is ``None``) are included. This is useful
+    for large matrix runs where most jobs pass and you only want to
+    inspect failures.
 
     Args:
         run_id: Numeric workflow run ID.
@@ -85,8 +87,9 @@ def get_run_info(
             job entry (with ``step_label`` on non-skipped steps).
             Default ``False`` omits steps to keep the response compact.
         only_failed: When ``True``, exclude jobs with
-            ``conclusion == "success"``. Default ``False`` returns all
-            jobs.
+            ``conclusion`` of ``"success"`` or ``"skipped"``. Jobs
+            still in progress (``conclusion`` is ``None``) are
+            included. Default ``False`` returns all jobs.
 
     Returns:
         Dict with run ID, name, status, conclusion, branch, commit SHA,
@@ -113,7 +116,9 @@ def get_run_info(
                 job.pop("steps", None)
         if only_failed:
             result["jobs"] = [
-                j for j in result["jobs"] if j.get("conclusion") != "success"
+                j
+                for j in result["jobs"]
+                if j.get("conclusion") not in ("success", "skipped")
             ]
         return result
     except GhError as exc:
@@ -132,9 +137,10 @@ def list_artifacts(run_id: int, repo: str | None = None) -> list[dict]:
             inside a git clone.
 
     Returns:
-        List of artifact records with id, name, size_in_bytes, and
-        expired fields. Returns an empty list if the run has no
-        artifacts.
+        List of artifact records with id, name, size_in_bytes,
+        expired, and ``artifact_slug`` fields. The ``artifact_slug``
+        can be passed directly to ``read_artifact_file``. Returns an
+        empty list if the run has no artifacts.
 
     Raises:
         ToolError: If the run is not found or the repo cannot be
@@ -142,7 +148,10 @@ def list_artifacts(run_id: int, repo: str | None = None) -> list[dict]:
     """
     try:
         artifacts = get_artifacts(str(run_id), repo=repo)
-        return [a.model_dump(mode="json") for a in artifacts]
+        result = [a.model_dump(mode="json") for a in artifacts]
+        for artifact in result:
+            artifact["artifact_slug"] = slugify(artifact["name"])
+        return result
     except GhNotFoundError as exc:
         raise ToolError(str(exc)) from exc
     except GhError as exc:
@@ -365,6 +374,7 @@ def search_log(  # noqa: PLR0913, PLR0912
     step_label: str | None = None,
     output_dir: str | None = None,
     context_lines: int = 0,
+    max_results: int | None = None,
 ) -> str:
     """Search downloaded log content for lines matching a regex pattern.
 
@@ -385,6 +395,9 @@ def search_log(  # noqa: PLR0913, PLR0912
             ``~/.local/share/gha-downloader/runs``).
         context_lines: Number of lines before and after each match
             to include (default 0).
+        max_results: Maximum number of result lines to return. When
+            set, collection stops once the line count reaches this
+            limit and a truncation note is appended.
 
     Returns:
         Matching lines formatted as ``<job_slug>:<line_number>: <line>``,
@@ -434,6 +447,8 @@ def search_log(  # noqa: PLR0913, PLR0912
             raise ToolError(f"No job logs found for run {run_id}.")
 
     groups: list[str] = []
+    total_lines = 0
+    truncated = False
     for slug, path in targets:
         lines = path.read_text().splitlines()
         matches: list[str] = []
@@ -443,13 +458,28 @@ def search_log(  # noqa: PLR0913, PLR0912
                 end = min(len(lines), i + context_lines + 1)
                 for j in range(start, end):
                     matches.append(f"{slug}:{j + 1}: {lines[j]}")
+                    if max_results is not None:
+                        total_lines += 1
+                        if total_lines >= max_results:
+                            break
+                if max_results is not None and total_lines >= max_results:
+                    truncated = True
+                    break
         if matches:
             groups.append("\n".join(matches))
+        if truncated:
+            break
 
     if not groups:
         return "No matches found."
 
-    return "\n\n".join(groups)
+    result = "\n\n".join(groups)
+    if truncated:
+        result += (
+            f"\n[results truncated at {max_results} lines — "
+            "narrow search with job_slug or step_label for more]"
+        )
+    return result
 
 
 def main_mcp() -> None:

@@ -130,6 +130,18 @@ class TestListArtifacts:
         result = list_artifacts(12345, repo="org/repo")
         assert result[0]["expired"] is True
 
+    def test_artifact_slug_present(self, monkeypatch):
+        art = ArtifactData.model_validate(
+            {"id": 100, "name": "My Artifact", "size_in_bytes": 2048, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo")
+        assert result[0]["artifact_slug"] == "my-artifact"
+
 
 class TestDownloadRun:
     def test_success(self, monkeypatch):
@@ -424,6 +436,78 @@ class TestGetRunInfoJobSlug:
         assert "step_label" not in result["jobs"][0]["steps"][0]
 
 
+class TestGetRunInfoOnlyFailed:
+    def test_excludes_skipped(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=1,
+                    name="pass-job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                ),
+                JobData(
+                    databaseId=2,
+                    name="skip-job",
+                    status="completed",
+                    conclusion="skipped",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                ),
+                JobData(
+                    databaseId=3,
+                    name="fail-job",
+                    status="completed",
+                    conclusion="failure",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                ),
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
+
+        result = get_run_info(12345, repo="org/repo", only_failed=True)
+        slugs = [j["job_slug"] for j in result["jobs"]]
+        assert "fail-job" in slugs
+        assert "pass-job" not in slugs
+        assert "skip-job" not in slugs
+
+    def test_includes_in_progress(self, monkeypatch):
+        mock_data = _make_run_view(
+            jobs=[
+                JobData(
+                    databaseId=1,
+                    name="running-job",
+                    status="in_progress",
+                    conclusion=None,
+                    startedAt="2024-01-01T00:00:00Z",
+                ),
+                JobData(
+                    databaseId=2,
+                    name="pass-job",
+                    status="completed",
+                    conclusion="success",
+                    startedAt="2024-01-01T00:00:00Z",
+                    completedAt="2024-01-01T00:01:00Z",
+                ),
+            ]
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_run_view",
+            mock.Mock(return_value=mock_data),
+        )
+
+        result = get_run_info(12345, repo="org/repo", only_failed=True)
+        slugs = [j["job_slug"] for j in result["jobs"]]
+        assert "running-job" in slugs
+        assert "pass-job" not in slugs
+
+
 class TestSearchLog:
     def test_matching_lines(self, tmp_path):
         job_dir = tmp_path / "12345" / "logs" / "build-job"
@@ -464,6 +548,24 @@ class TestSearchLog:
     def test_run_not_downloaded(self, tmp_path):
         with pytest.raises(ToolError, match="No logs directory"):
             search_log(99999, "Error", output_dir=str(tmp_path))
+
+    def test_max_results_truncates(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("Error1\nError2\nError3\n")
+
+        result = search_log(12345, "Error", output_dir=str(tmp_path), max_results=2)
+        assert "Error1" in result
+        assert "Error2" in result
+        assert "truncated" in result
+
+    def test_max_results_not_reached(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("Error1\nError2\n")
+
+        result = search_log(12345, "Error", output_dir=str(tmp_path), max_results=50)
+        assert "truncated" not in result
 
     def test_xdg_data_home_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
