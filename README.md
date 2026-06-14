@@ -6,14 +6,10 @@ Download logs and artifacts from GitHub Actions runs for offline inspection.
 
 ## Installation
 
-```sh
-uv tool install .
-```
-
-During development, prefix commands with `uv run` instead:
+The `gh` CLI must be installed and proper `gh auth` must be available with the `repo` read scope.
 
 ```sh
-uv run gha-download ...
+uv tool install "gha-downloader @ git+https://github.com/astrojuanlu/gha-downloader.git"
 ```
 
 ## Usage
@@ -30,10 +26,6 @@ The `--repo` is inferred from the URL. You can also use a numeric run ID:
 ```sh
 $ gha-download 27357958065 --repo canonical/mysql-operators
 ```
-
-### Prerequisites
-
-`gh auth login` must have been run with the `repo` read scope. Unauthenticated runs produce a `gh: HTTP 401` error.
 
 ### Repo inference
 
@@ -88,8 +80,6 @@ Step numbers may skip (skipped steps produce no file).
 
 ### Flags
 
-`-v` / `-vv` can appear anywhere in the invocation.
-
 ```
 gha-download [-h] [--repo ORG/REPO] [--job-id JOB_ID]
              [--dir DIR] [--force] [-v] RUN_ID
@@ -118,13 +108,20 @@ gha-download [-h] [--repo ORG/REPO] [--job-id JOB_ID]
 
 An MCP server is available for AI agents to inspect GitHub Actions runs programmatically.
 
+### Installation
+
+```sh
+uv tool install "gha-downloader[mcp] @ git+https://github.com/astrojuanlu/gha-downloader.git"
+```
+
 ### Invocation
 
 ```sh
-gha-mcp-server
+gha-downloader-mcp
 ```
 
-The server communicates over stdio using the MCP JSON-RPC protocol. Use it with any MCP-compatible client (e.g. Claude Desktop, opencode).
+The server communicates over stdio using the MCP JSON-RPC protocol.
+Use it with any MCP-compatible client (e.g. Claude Desktop, OpenCode).
 
 ### Tools
 
@@ -137,15 +134,11 @@ The server communicates over stdio using the MCP JSON-RPC protocol. Use it with 
 | `read_log` | Return the text content of a downloaded log file |
 | `read_artifact_file` | Return the text content of a file inside a downloaded artifact |
 
-### Prerequisites
-
-`gh auth login` must have been run beforehand with the `repo` read scope.
-
 ## Development
 
 ```sh
 $ uv sync
 $ uv run pytest
-$ uv run ruff check --fix && uv run ruff format
-$ uv run ty check src
+$ uv run ruff format && uv run ruff check --fix
+$ uv run ty check
 ```
