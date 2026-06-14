@@ -127,11 +127,12 @@ Use it with any MCP-compatible client (e.g. Claude Desktop, OpenCode).
 
 | Tool | Description |
 |------|-------------|
-| `get_run_info` | Fetch run metadata and job list without downloading |
+| `get_run_info` | Fetch run metadata and job list without downloading. Pass `include_steps=True` for per-step detail with `step_label` values. Pass `only_failed=True` to return only non-successful jobs (useful for large matrix runs). |
 | `list_artifacts` | List artifact names, sizes, and expiry status for a run |
-| `download_run` | Download all logs and artifacts for a run to disk |
+| `download_run` | Download all logs and artifacts for a run to disk. Pass `job_id` to download a single job (faster). Cached on re-invocation; pass `force=True` to re-download. |
 | `list_run_files` | Enumerate downloaded files for a run (logs + artifacts) |
-| `read_log` | Return the text content of a downloaded log file |
+| `list_logs` | List downloaded job slugs and their step labels. Use before `search_log` to discover available `job_slug` values. Does not return log content. |
+| `search_log` | Search downloaded logs for lines matching a regex. Pass `job_slug` to scope to one job, `step_label` to scope to one step, `context_lines` for surrounding context. |
 | `read_artifact_file` | Return the text content of a file inside a downloaded artifact |
 
 ## Development

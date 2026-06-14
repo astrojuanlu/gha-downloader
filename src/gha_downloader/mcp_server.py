@@ -55,7 +55,10 @@ _ANN_LOCAL_READ_ONLY = ToolAnnotations(
 
 @mcp.tool(annotations=_ANN_READ_ONLY)
 def get_run_info(
-    run_id: int, repo: str | None = None, include_steps: bool = False
+    run_id: int,
+    repo: str | None = None,
+    include_steps: bool = False,
+    only_failed: bool = False,
 ) -> dict:
     """Get metadata for a GitHub Actions run without downloading files.
 
@@ -70,6 +73,10 @@ def get_run_info(
     workflow YAML name overrides are used. Call ``list_logs`` for
     authoritative on-disk step labels.
 
+    When ``only_failed=True``, only jobs whose conclusion is not
+    ``"success"`` are returned. This is useful for large matrix runs
+    where most jobs pass and you only want to inspect failures.
+
     Args:
         run_id: Numeric workflow run ID.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
@@ -77,11 +84,15 @@ def get_run_info(
         include_steps: When ``True``, include per-step detail in each
             job entry (with ``step_label`` on non-skipped steps).
             Default ``False`` omits steps to keep the response compact.
+        only_failed: When ``True``, exclude jobs with
+            ``conclusion == "success"``. Default ``False`` returns all
+            jobs.
 
     Returns:
         Dict with run ID, name, status, conclusion, branch, commit SHA,
         trigger event, workflow name, URL, and a list of jobs (each
-        with ``job_slug``; steps only when ``include_steps=True``).
+        with ``job_slug``; steps only when ``include_steps=True``;
+        filtered to non-successful jobs when ``only_failed=True``).
 
     Raises:
         ToolError: If the run is not found or the repo cannot be
@@ -100,6 +111,10 @@ def get_run_info(
                         )
             if not include_steps:
                 job.pop("steps", None)
+        if only_failed:
+            result["jobs"] = [
+                j for j in result["jobs"] if j.get("conclusion") != "success"
+            ]
         return result
     except GhError as exc:
         raise ToolError(str(exc)) from exc
@@ -357,9 +372,14 @@ def search_log(  # noqa: PLR0913, PLR0912
         run_id: Numeric workflow run ID.
         pattern: Regular expression pattern to search for.
         job_slug: Filesystem-safe slug of the job to search. When
-            omitted, searches all job logs.
+            omitted, searches all job logs. Use ``list_logs`` or
+            ``get_run_info`` to discover available ``job_slug`` values.
         step_label: Step label within the job. When omitted with
             ``job_slug``, searches ``full.log`` for that job.
+            Note: ``full.log`` is the concatenation of all step logs,
+            so a match will appear once per job regardless of which
+            step produced it. Specify ``step_label`` to scope the
+            search to a single step file.
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
