@@ -3,17 +3,24 @@ import logging as _logging
 import re
 import signal
 import sys
+from pathlib import Path
 
 import structlog
 
 from . import repo as repo_module
-from .downloader import DownloaderError, download_run
+from .downloader import DownloaderError, _extract_artifact_ids, download_run, slugify
 from .gh import (
     GhAutoDetectError,
+    GhExpiredArtifactError,
     GhNetworkError,
     GhNotFoundError,
     GhNotInstalledError,
     GhSpawnError,
+    get_artifacts,
+    get_log_text,
+)
+from .gh import (
+    download_artifact as gh_download_artifact,
 )
 
 logger = structlog.get_logger()
@@ -91,6 +98,18 @@ def build_download_parser() -> argparse.ArgumentParser:
         default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG).",
     )
+    parser.add_argument(
+        "--list-artifacts",
+        action="store_true",
+        help="List artifacts for the run (name, size, status, slug) and exit.",
+    )
+    parser.add_argument(
+        "--artifact",
+        action="append",
+        metavar="NAME",
+        dest="artifacts",
+        help="Download a named artifact. Repeatable.",
+    )
     return parser
 
 
@@ -100,6 +119,104 @@ def validate_repo_arg(value: str) -> str:
     except ValueError:
         msg = f"Invalid repository format: {value!r}. Expected ORG/REPO."
         raise argparse.ArgumentTypeError(msg) from None
+
+
+def _format_size(size_bytes: int) -> str:
+    mb = size_bytes / (1024 * 1024)
+    if mb >= 1:
+        return f"{mb:.1f} MB"
+    kb = size_bytes / 1024
+    if kb >= 1:
+        return f"{kb:.1f} KB"
+    return f"{size_bytes} B"
+
+
+def _list_artifacts_cmd(
+    run_id: int,
+    repo: str | None,
+    args: argparse.Namespace,
+    job_id: int | None = None,
+) -> None:
+    try:
+        artifacts = get_artifacts(str(run_id), repo=repo)
+    except GhNotFoundError:
+        artifacts = []
+    except GhNotInstalledError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except (GhNetworkError, GhSpawnError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(3)
+    if job_id is not None:
+        try:
+            log_text = get_log_text(repo, job_id)
+        except GhNotFoundError:
+            print(f"Error: job {job_id} not found.", file=sys.stderr)
+            sys.exit(2)
+        except (GhNetworkError, GhSpawnError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(3)
+        id_set = set(_extract_artifact_ids(log_text))
+        artifacts = [a for a in artifacts if a.artifact_id in id_set]
+        if not id_set:
+            sys.exit(0)
+    for artifact in artifacts:
+        slug = slugify(artifact.name)
+        size = _format_size(artifact.size_in_bytes)
+        status = "expired" if artifact.expired else "available"
+        print(f"{artifact.name}  {size}  {status}  slug: {slug}")
+    sys.exit(0)
+
+
+def _download_artifact_cmd(
+    run_id: int,
+    repo: str | None,
+    name: str,
+    args: argparse.Namespace,
+) -> None:
+    try:
+        artifacts = get_artifacts(str(run_id), repo=repo)
+    except GhNotFoundError:
+        print(
+            f"Error: artifact '{name}' not found. No artifacts exist for this run.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except GhNotInstalledError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except (GhNetworkError, GhSpawnError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(3)
+
+    matched = next((a for a in artifacts if a.name == name), None)
+    if matched is None:
+        available = ", ".join(a.name for a in artifacts) or "(none)"
+        print(
+            f"Error: artifact '{name}' not found. Available: {available}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if matched.expired:
+        print(f"Error: artifact '{name}' has expired.", file=sys.stderr)
+        sys.exit(2)
+
+    run_dir = Path(args.dir) / str(run_id)
+    art_slug = slugify(matched.name)
+    art_dir = run_dir / "artifacts" / art_slug
+    art_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        gh_download_artifact(str(run_id), matched.name, str(art_dir), repo=repo)
+    except GhExpiredArtifactError:
+        print(f"Error: artifact '{name}' has expired.", file=sys.stderr)
+        sys.exit(2)
+    except GhNotInstalledError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except (GhNetworkError, GhSpawnError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(3)
 
 
 def _run_download(args: argparse.Namespace, url_repo: str | None) -> None:
@@ -174,4 +291,21 @@ def main_download() -> None:
         )
     if args.repo is None and url_repo is not None:
         args.repo = repo_module.validate_repo(url_repo)
+
+    if args.list_artifacts and args.artifacts:
+        print(
+            "Error: --list-artifacts and --artifact are mutually exclusive.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.list_artifacts:
+        _list_artifacts_cmd(run_id, args.repo, args, job_id=args.job_id)
+        return  # _list_artifacts_cmd exits, but satisfy type checkers
+
+    if args.artifacts:
+        for name in args.artifacts:
+            _download_artifact_cmd(run_id, args.repo, name, args)
+        return
+
     _run_download(args, url_repo)

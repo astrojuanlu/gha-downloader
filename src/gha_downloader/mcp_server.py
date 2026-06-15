@@ -13,9 +13,16 @@ except ImportError as exc:
 
 import structlog
 
-from .downloader import DownloaderError, slugify
+from .downloader import DownloaderError, _extract_artifact_ids, slugify
 from .downloader import download_run as _download_run
-from .gh import GhError, GhNotFoundError, get_artifacts, get_run_view
+from .gh import (
+    GhError,
+    GhNotFoundError,
+    get_artifacts,
+    get_log_text,
+    get_run_view,
+)
+from .gh import download_artifact as _gh_download_artifact
 
 mcp = FastMCP(
     "gha-downloader",
@@ -29,10 +36,13 @@ mcp = FastMCP(
         "<run_dir>/logs/<job_slug>/full.log or "
         "<run_dir>/logs/<job_slug>/<step_label>.txt\n"
         "\n"
+        "For artifacts: list_artifacts → download_artifact(slug) → "
+        "read_artifact_file.\n"
+        "\n"
         "To find errors in large logs without reading them in full, "
         "use search_log as the first step.\n"
         "\n"
-        "Other tools: list_artifacts, list_run_files, read_artifact_file."
+        "Other tools: list_run_files."
     ),
 )
 
@@ -47,6 +57,9 @@ _ANN_READ_ONLY = ToolAnnotations(
 )
 _ANN_DESTRUCTIVE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
+)
+_ANN_WRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
 )
 _ANN_LOCAL_READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
@@ -128,19 +141,26 @@ def get_run_info(
 
 
 @mcp.tool(annotations=_ANN_READ_ONLY)
-def list_artifacts(run_id: int, repo: str | None = None) -> list[dict]:
+def list_artifacts(
+    run_id: int, repo: str | None = None, job_id: int | None = None
+) -> list[dict]:
     """List artifacts for a GitHub Actions run without downloading them.
 
     Args:
         run_id: Numeric workflow run ID.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
             inside a git clone.
+        job_id: Optional job ID. When set, only artifacts uploaded by
+            this job are returned (determined by parsing the job log
+            for ``Artifact ID is`` messages). When ``None``, all
+            run artifacts are returned.
 
     Returns:
         List of artifact records with id, name, size_in_bytes,
         expired, and ``artifact_slug`` fields. The ``artifact_slug``
         can be passed directly to ``read_artifact_file``. Returns an
-        empty list if the run has no artifacts.
+        empty list if the run has no artifacts or if ``job_id`` is
+        set and the job uploaded no artifacts.
 
     Raises:
         ToolError: If the run is not found or the repo cannot be
@@ -148,6 +168,10 @@ def list_artifacts(run_id: int, repo: str | None = None) -> list[dict]:
     """
     try:
         artifacts = get_artifacts(str(run_id), repo=repo)
+        if job_id is not None:
+            log_text = get_log_text(repo, job_id)
+            id_set = set(_extract_artifact_ids(log_text))
+            artifacts = [a for a in artifacts if a.artifact_id in id_set]
         result = [a.model_dump(mode="json") for a in artifacts]
         for artifact in result:
             artifact["artifact_slug"] = slugify(artifact["name"])
@@ -166,11 +190,14 @@ def download_run(
     output_dir: str | None = None,
     force: bool = False,
 ) -> str:
-    """Download logs and artifacts for a GitHub Actions run.
+    """Download logs for a GitHub Actions run.
 
-    Passing ``job_id`` restricts the download to a single job's logs
-    and artifacts, which is significantly faster and avoids timeouts
-    on large runs. Without ``job_id``, all jobs are downloaded.
+    Downloads only logs and ``run.json``; artifacts are not included.
+    Use ``list_artifacts`` to discover available artifacts and
+    ``download_artifact`` to download individual ones.
+
+    Passing ``job_id`` restricts the download to a single job's logs,
+    which is significantly faster and avoids timeouts on large runs.
 
     When the run directory already exists and ``force`` is ``False``,
     returns the cached path immediately without re-downloading.
@@ -179,7 +206,7 @@ def download_run(
         run_id: Numeric workflow run ID.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
             inside a git clone.
-        job_id: Only download logs and artifacts for this job ID.
+        job_id: Only download logs for this job ID.
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
@@ -211,6 +238,74 @@ def download_run(
         raise ToolError(str(exc)) from exc
     except GhError as exc:
         raise ToolError(str(exc)) from exc
+
+
+@mcp.tool(annotations=_ANN_WRITE)
+def download_artifact(
+    run_id: int,
+    artifact_slug: str,
+    repo: str | None = None,
+    output_dir: str | None = None,
+) -> str:
+    """Download a single artifact by slug into the existing run directory.
+
+    The run directory must already exist (call ``download_run`` first).
+    Use ``list_artifacts`` to discover available ``artifact_slug`` values.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        artifact_slug: Filesystem-safe slug of the artifact (as
+            returned by ``list_artifacts``).
+        repo: Repository in ORG/REPO format. Auto-detected if omitted
+            inside a git clone.
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+
+    Returns:
+        The absolute path of the artifact directory on success.
+
+    Raises:
+        ToolError: If the run directory does not exist, the artifact
+            slug is not found, or the artifact has expired.
+    """
+    if output_dir is None:
+        output_dir = _default_output_dir()
+    run_dir = Path(output_dir) / str(run_id)
+    if not run_dir.is_dir():
+        raise ToolError(
+            f"Run directory {run_dir} does not exist. "
+            "Download the run first with download_run."
+        )
+    try:
+        artifacts = get_artifacts(str(run_id), repo=repo)
+    except GhNotFoundError as exc:
+        raise ToolError(str(exc)) from exc
+    except GhError as exc:
+        raise ToolError(str(exc)) from exc
+
+    slug_map = {slugify(a.name): a for a in artifacts}
+    if artifact_slug not in slug_map:
+        available = sorted(slug_map)
+        raise ToolError(
+            f"Artifact slug '{artifact_slug}' not found. "
+            f"Available slugs: {', '.join(available)}"
+        )
+
+    artifact = slug_map[artifact_slug]
+    if artifact.expired:
+        raise ToolError(
+            f"Artifact '{artifact.name}' (slug: {artifact_slug}) has expired."
+        )
+
+    art_dir = run_dir / "artifacts" / artifact_slug
+    art_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _gh_download_artifact(str(run_id), artifact.name, str(art_dir), repo=repo)
+    except GhError as exc:
+        raise ToolError(str(exc)) from exc
+
+    return str(art_dir.resolve())
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
@@ -260,9 +355,13 @@ def list_run_files(run_id: int, output_dir: str | None = None) -> str:
 def list_logs(run_id: int, output_dir: str | None = None) -> str:
     """List downloaded job logs for a run, showing slugs and step labels.
 
-    Returns a discovery listing of job slugs and their available step
-    labels. Does not return log file content — use native file-read
-    tools with the path from ``download_run`` to read log files.
+    The first line of output is the absolute run directory path. Use
+    this to construct full log file paths with the pattern
+    ``<run_dir>/logs/<job_slug>/full.log`` or
+    ``<run_dir>/logs/<job_slug>/<step_label>.txt``.
+
+    Does not return log file content — use native file-read tools to
+    read log files.
 
     Args:
         run_id: Numeric workflow run ID.
@@ -271,8 +370,8 @@ def list_logs(run_id: int, output_dir: str | None = None) -> str:
             ``~/.local/share/gha-downloader/runs``).
 
     Returns:
-        Each job slug followed by an indented line listing its
-        available step labels.
+        The absolute run directory path as the first line, followed by
+        each job slug and its available step labels.
 
     Raises:
         ToolError: If the run has not been downloaded or no job logs
@@ -292,7 +391,7 @@ def list_logs(run_id: int, output_dir: str | None = None) -> str:
     slugs = sorted(d.name for d in logs_dir.iterdir() if d.is_dir())
     if not slugs:
         raise ToolError(f"No job logs found for run {run_id}.")
-    lines: list[str] = []
+    lines: list[str] = [str(run_dir.resolve())]
     for s in slugs:
         lines.append(s)
         step_files = sorted(

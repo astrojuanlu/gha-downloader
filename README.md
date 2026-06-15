@@ -18,7 +18,7 @@ uv tool install "gha-downloader @ git+https://github.com/astrojuanlu/gha-downloa
 $ gh auth login
 $ gha-download https://github.com/canonical/mysql-operators/actions/runs/27357958065
 $ ls runs/27357958065/
-artifacts/  logs/  run.json
+logs/  run.json
 ```
 
 The `--repo` is inferred from the URL. You can also use a numeric run ID:
@@ -69,30 +69,57 @@ runs/27357958065/
       01_set-up-job.txt             # per-step .txt files are non-overlapping
       02_checkout.txt               #   partitions of full.log
       ...
-  artifacts/
+  artifacts/                        # only present when downloaded explicitly
     <artifact-slug>/
       ...                           # extracted contents
-    expired-artifact/
-      .expired                      # marker for expired artifacts
 ```
 
 Step numbers may skip (skipped steps produce no file).
+
+### Artifact commands
+
+List available artifacts for a run:
+
+```sh
+$ gha-download 27357958065 --list-artifacts
+test-results  2.4 MB  available  slug: test-results
+build-logs    0.5 MB  available  slug: build-logs
+old-data      1.1 MB  expired    slug: old-data
+```
+
+Download a specific artifact (run directory created if absent):
+
+```sh
+$ gha-download 27357958065 --artifact test-results
+$ ls runs/27357958065/artifacts/test-results/
+...
+```
+
+Download multiple artifacts in one invocation:
+
+```sh
+$ gha-download 27357958065 --artifact test-results --artifact build-logs
+```
 
 ### Flags
 
 ```
 gha-download [-h] [--repo ORG/REPO] [--job-id JOB_ID]
-             [--dir DIR] [--force] [-v] RUN_ID
+             [--dir DIR] [--force] [-v]
+             [--list-artifacts | --artifact NAME [...]]
+             RUN_ID
 ```
 
-| Flag       | Default  | Description                                          |
-|------------|----------|------------------------------------------------------|
-| `RUN_ID`   | required | Numeric workflow run ID or full Actions URL          |
-| `--repo`   | auto     | Repository in `ORG/REPO` format (inferred from URL)  |
-| `--job-id` | none     | Filter logs and artifacts by job ID                  |
-| `--dir`    | `./runs` | Root directory for downloads                         |
-| `--force`  | off      | Overwrite existing run directory                     |
-| `-v`       | 0        | Verbosity: `-v` INFO, `-vv` DEBUG                   |
+| Flag                | Default  | Description                                          |
+|---------------------|----------|------------------------------------------------------|
+| `RUN_ID`            | required | Numeric workflow run ID or full Actions URL          |
+| `--repo`            | auto     | Repository in `ORG/REPO` format (inferred from URL)  |
+| `--job-id`          | none     | Filter logs and artifact listing by job ID          |
+| `--dir`             | `./runs` | Root directory for downloads                         |
+| `--force`           | off      | Overwrite existing run directory                     |
+| `-v`                | 0        | Verbosity: `-v` INFO, `-vv` DEBUG                    |
+| `--list-artifacts`  | off      | List artifacts (name, size, status, slug) and exit   |
+| `--artifact NAME`   | none     | Download a named artifact. Repeatable. Mutually exclusive with `--list-artifacts`. |
 
 ### Exit codes
 
@@ -128,8 +155,8 @@ Use it with any MCP-compatible client (e.g. Claude Desktop, OpenCode).
 | Tool | Description |
 |------|-------------|
 | `get_run_info` | Fetch run metadata and job list without downloading. Pass `include_steps=True` for per-step detail with `step_label` values. Pass `only_failed=True` to return only non-successful jobs (useful for large matrix runs). |
-| `list_artifacts` | List artifact names, sizes, and expiry status for a run |
-| `download_run` | Download all logs and artifacts for a run to disk. Pass `job_id` to download a single job (faster). Cached on re-invocation; pass `force=True` to re-download. |
+| `list_artifacts` | List artifact names, sizes, and expiry status for a run. Pass `job_id` to list only artifacts uploaded by a specific job. |
+| `download_run` | Download logs and `run.json` for a run to disk. Pass `job_id` to download a single job (faster). Cached on re-invocation; pass `force=True` to re-download. |
 | `list_run_files` | Enumerate downloaded files for a run (logs + artifacts) |
 | `list_logs` | List downloaded job slugs and their step labels. Use before `search_log` to discover available `job_slug` values. Does not return log content. |
 | `search_log` | Search downloaded logs for lines matching a regex. Pass `job_slug` to scope to one job, `step_label` to scope to one step, `context_lines` for surrounding context. |

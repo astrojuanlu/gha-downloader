@@ -5,11 +5,11 @@ import pytest
 
 from gha_downloader.downloader import (
     DownloaderError,
+    _extract_artifact_ids,
     _split_log_by_groups,
     download_run,
 )
 from gha_downloader.gh import (
-    ArtifactData,
     GhAutoDetectError,
     GhNotFoundError,
     JobData,
@@ -76,10 +76,6 @@ def test_download_run_fetches_metadata_and_saves(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         "gha_downloader.downloader.get_job_steps",
-        mock.Mock(return_value=[]),
-    )
-    monkeypatch.setattr(
-        "gha_downloader.downloader.get_artifacts",
         mock.Mock(return_value=[]),
     )
 
@@ -157,10 +153,6 @@ def test_download_run_dir_exists_force(monkeypatch, tmp_path):
         "gha_downloader.downloader.get_job_steps",
         mock.Mock(return_value=[]),
     )
-    monkeypatch.setattr(
-        "gha_downloader.downloader.get_artifacts",
-        mock.Mock(return_value=[]),
-    )
 
     download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path), force=True)
     assert not (run_dir / "existing.txt").exists()
@@ -226,10 +218,6 @@ def test_download_run_job_filter(monkeypatch, tmp_path):
         "gha_downloader.downloader.get_job_steps",
         mock.Mock(return_value=[]),
     )
-    monkeypatch.setattr(
-        "gha_downloader.downloader.get_artifacts",
-        mock.Mock(return_value=[]),
-    )
 
     download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path), job_id=1)
 
@@ -274,7 +262,8 @@ def test_download_run_job_filter_not_found(monkeypatch, tmp_path):
         download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path), job_id=99)
 
 
-def test_download_run_with_artifacts(monkeypatch, tmp_path):
+def test_download_run_does_not_download_artifacts(monkeypatch, tmp_path):
+    """download_run no longer downloads artifacts; no artifacts/ dir created."""
     mock_run_view = RunViewData(
         databaseId=12345,
         name="CI",
@@ -304,15 +293,6 @@ def test_download_run_with_artifacts(monkeypatch, tmp_path):
         referenced_workflows=[],
     )
 
-    mock_artifact = ArtifactData.model_validate(
-        {
-            "id": 100,
-            "name": "my-artifact",
-            "size_in_bytes": 100,
-            "expired": False,
-        }
-    )
-
     monkeypatch.setattr(
         "gha_downloader.downloader.get_run_view",
         mock.Mock(return_value=mock_run_view),
@@ -333,20 +313,10 @@ def test_download_run_with_artifacts(monkeypatch, tmp_path):
         "gha_downloader.downloader.get_job_steps",
         mock.Mock(return_value=[]),
     )
-    monkeypatch.setattr(
-        "gha_downloader.downloader.get_artifacts",
-        mock.Mock(return_value=[mock_artifact]),
-    )
-    mock_dl = mock.Mock()
-    monkeypatch.setattr(
-        "gha_downloader.downloader.gh_download_artifact",
-        mock_dl,
-    )
 
     download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path))
 
-    assert mock_dl.call_count == 1
-    assert mock_dl.call_args[0][1] == "my-artifact"
+    assert not (tmp_path / "12345" / "artifacts").exists()
 
 
 def test_download_run_reusable_workflow_creates_per_step_files(monkeypatch, tmp_path):
@@ -406,10 +376,6 @@ def test_download_run_reusable_workflow_creates_per_step_files(monkeypatch, tmp_
     monkeypatch.setattr(
         "gha_downloader.downloader.get_job_steps",
         mock.Mock(return_value=mock_steps),
-    )
-    monkeypatch.setattr(
-        "gha_downloader.downloader.get_artifacts",
-        mock.Mock(return_value=[]),
     )
 
     download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path))
@@ -631,10 +597,6 @@ def test_download_run_job_filter_bar_total_is_one(monkeypatch, tmp_path):
         "gha_downloader.downloader.get_job_steps",
         mock.Mock(return_value=[]),
     )
-    monkeypatch.setattr(
-        "gha_downloader.downloader.get_artifacts",
-        mock.Mock(return_value=[]),
-    )
 
     download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path), job_id=1)
 
@@ -720,13 +682,26 @@ def test_download_run_bar_title_not_overwritten(monkeypatch, tmp_path):
         "gha_downloader.downloader.get_job_steps",
         mock.Mock(return_value=[]),
     )
-    monkeypatch.setattr(
-        "gha_downloader.downloader.get_artifacts",
-        mock.Mock(return_value=[]),
-    )
 
     download_run(12345, repo="myorg/myrepo", output_dir=str(tmp_path))
 
     assert captured_bar is not None
     assert captured_bar.title_set_count == 0
     assert captured_bar.text_set_count >= 1
+
+
+class TestExtractArtifactIds:
+    def test_ids_present(self):
+        log = "some line\nArtifact ID is 42\nother line\nArtifact ID is 99\n"
+        result = _extract_artifact_ids(log)
+        assert result == [42, 99]
+
+    def test_deduplicates(self):
+        log = "Artifact ID is 10\nArtifact ID is 10\nArtifact ID is 20\n"
+        result = _extract_artifact_ids(log)
+        assert result == [10, 20]
+
+    def test_no_matches(self):
+        log = "no artifact lines here\njust regular log\n"
+        result = _extract_artifact_ids(log)
+        assert result == []

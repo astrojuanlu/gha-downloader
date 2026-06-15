@@ -14,6 +14,7 @@ from gha_downloader.gh import (
 )
 from gha_downloader.mcp_server import (
     _default_output_dir,
+    download_artifact,
     download_run,
     get_run_info,
     list_artifacts,
@@ -142,6 +143,57 @@ class TestListArtifacts:
         result = list_artifacts(12345, repo="org/repo")
         assert result[0]["artifact_slug"] == "my-artifact"
 
+    def test_job_id_filters_artifacts(self, monkeypatch):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
+        )
+        art2 = ArtifactData.model_validate(
+            {"id": 200, "name": "build-logs", "size_in_bytes": 1024, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art1, art2]),
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_log_text",
+            mock.Mock(return_value="Artifact ID is 100\n"),
+        )
+
+        result = list_artifacts(12345, repo="org/repo", job_id=42)
+        assert len(result) == 1
+        assert result[0]["name"] == "test-results"
+
+    def test_job_id_no_artifact_ids_returns_empty(self, monkeypatch):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art1]),
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_log_text",
+            mock.Mock(return_value="no artifact lines\n"),
+        )
+
+        result = list_artifacts(12345, repo="org/repo", job_id=42)
+        assert result == []
+
+    def test_no_job_id_returns_all(self, monkeypatch):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
+        )
+        art2 = ArtifactData.model_validate(
+            {"id": 200, "name": "build-logs", "size_in_bytes": 1024, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art1, art2]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo")
+        assert len(result) == 2
+
 
 class TestDownloadRun:
     def test_success(self, monkeypatch):
@@ -233,6 +285,61 @@ class TestListLogs:
     def test_no_logs_directory(self, tmp_path):
         with pytest.raises(ToolError, match="No logs directory"):
             list_logs(12345, output_dir=str(tmp_path))
+
+    def test_header_line_is_run_dir_path(self, tmp_path):
+        run_dir = tmp_path / "12345" / "logs" / "build-job"
+        run_dir.mkdir(parents=True)
+        (run_dir / "full.log").write_text("log")
+
+        result = list_logs(12345, output_dir=str(tmp_path))
+        first_line = result.split("\n")[0]
+        assert str((tmp_path / "12345").resolve()) == first_line
+
+
+class TestDownloadArtifact:
+    def test_run_not_downloaded(self, tmp_path):
+        with pytest.raises(ToolError, match="does not exist"):
+            download_artifact(
+                12345,
+                artifact_slug="my-artifact",
+                output_dir=str(tmp_path),
+            )
+
+    def test_slug_not_found(self, monkeypatch, tmp_path):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
+        art = ArtifactData.model_validate(
+            {"id": 100, "name": "other-art", "size_in_bytes": 2048, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art]),
+        )
+
+        with pytest.raises(ToolError, match="not found"):
+            download_artifact(
+                12345,
+                artifact_slug="missing-slug",
+                output_dir=str(tmp_path),
+            )
+
+    def test_expired_artifact(self, monkeypatch, tmp_path):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
+        art = ArtifactData.model_validate(
+            {"id": 200, "name": "old-art", "size_in_bytes": 1024, "expired": True}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art]),
+        )
+
+        with pytest.raises(ToolError, match="expired"):
+            download_artifact(
+                12345,
+                artifact_slug="old-art",
+                output_dir=str(tmp_path),
+            )
 
 
 class TestReadArtifactFile:

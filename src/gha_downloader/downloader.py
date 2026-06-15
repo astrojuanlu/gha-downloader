@@ -9,17 +9,11 @@ from alive_progress import alive_bar
 from ruamel.yaml import YAML
 
 from .gh import (
-    GhExpiredArtifactError,
-    GhNotFoundError,
-    get_artifacts,
     get_job_steps,
     get_log_text,
     get_run_view,
     get_run_workflow_info,
     get_workflow_yaml_content,
-)
-from .gh import (
-    download_artifact as gh_download_artifact,
 )
 
 logger = structlog.get_logger(__name__)
@@ -30,6 +24,13 @@ class DownloaderError(Exception):
 
 
 _GROUP_RUN_RE = re.compile(r"##\[group]run\s", re.IGNORECASE)
+
+_ARTIFACT_ID_RE = re.compile(r"Artifact ID is (\d+)")
+
+
+def _extract_artifact_ids(log_text: str) -> list[int]:
+    """Extract sorted, deduplicated artifact IDs from a job log."""
+    return sorted({int(m.group(1)) for m in _ARTIFACT_ID_RE.finditer(log_text)})
 
 
 def slugify(name: str) -> str:
@@ -58,14 +59,6 @@ def _clean_step_name(raw: str) -> str:
             executable = executable.rsplit("@", 1)[0]
         name = executable
     return name
-
-
-def _extract_artifact_ids(log_text: str) -> list[int]:
-    """Extract artifact IDs from job log upload messages."""
-    ids: set[int] = set()
-    for m in re.finditer(r"Artifact ID is (\d+)", log_text):
-        ids.add(int(m.group(1)))
-    return sorted(ids)
 
 
 def _split_log_by_groups(
@@ -132,8 +125,8 @@ def _download_job_logs(
     run_dir: Path,
     run_id: int,
     bar: Any | None = None,
-) -> list[int]:
-    """Download logs for selected jobs. Returns artifact IDs found in logs."""
+) -> None:
+    """Download logs for selected jobs."""
     run_id_str = str(run_id)
     wf_info = get_run_workflow_info(repo, run_id_str)
     is_reusable = bool(wf_info.referenced_workflows)
@@ -148,8 +141,6 @@ def _download_job_logs(
     logger.info("downloading_logs", job_count=len(jobs))
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(exist_ok=True)
-
-    all_artifact_ids: list[int] = []
 
     for job in jobs:
         if bar is not None:
@@ -167,11 +158,6 @@ def _download_job_logs(
 
         (job_logs_dir / "full.log").write_text(log_text)
 
-        artifact_ids = _extract_artifact_ids(log_text)
-        all_artifact_ids.extend(artifact_ids)
-        if artifact_ids:
-            logger.info("artifact_ids_found", ids=artifact_ids)
-
         step_times = get_job_steps(repo, job.databaseId)
         step_texts = _split_log_by_groups(log_text, step_times, yaml_names)
         for label, text in step_texts.items():
@@ -183,56 +169,6 @@ def _download_job_logs(
 
         if bar is not None:
             bar()
-
-    return all_artifact_ids
-
-
-def _download_artifacts(
-    repo: str | None,
-    run_id_str: str,
-    run_dir: Path,
-    artifact_ids: list[int] | None = None,
-) -> int:
-    logger.info("downloading_artifacts")
-    artifacts_dir = run_dir / "artifacts"
-    artifacts_dir.mkdir(exist_ok=True)
-
-    try:
-        artifacts = get_artifacts(run_id_str, repo=repo)
-    except GhNotFoundError:
-        logger.warning("no_artifacts_found")
-        return 0
-
-    if artifact_ids is not None:
-        id_set = set(artifact_ids)
-        artifacts = [a for a in artifacts if a.artifact_id in id_set]
-
-    for artifact in artifacts:
-        art_slug = slugify(artifact.name)
-        art_dir = artifacts_dir / art_slug
-
-        if artifact.expired:
-            print(
-                f"Warning: Artifact '{artifact.name}' has expired.",
-                file=sys.stderr,
-            )
-            art_dir.mkdir(exist_ok=True)
-            (art_dir / ".expired").touch()
-            continue
-
-        logger.info("downloading_artifact", name=artifact.name)
-        art_dir.mkdir(exist_ok=True)
-        try:
-            gh_download_artifact(run_id_str, artifact.name, str(art_dir), repo=repo)
-        except GhExpiredArtifactError:
-            print(
-                f"Warning: Artifact '{artifact.name}' has expired.",
-                file=sys.stderr,
-            )
-            (art_dir / ".expired").touch()
-            continue
-
-    return len(artifacts)
 
 
 def download_run(
@@ -279,22 +215,8 @@ def download_run(
             file=sys.stderr,
             ctrl_c=False,
         ) as bar:
-            artifact_ids = _download_job_logs(
-                repo, jobs_to_download, run_dir, run_id, bar=bar
-            )
-            if job_id is not None:
-                if artifact_ids:
-                    art_count = _download_artifacts(
-                        repo, run_id_str, run_dir, artifact_ids
-                    )
-                else:
-                    art_count = 0
-            else:
-                art_count = _download_artifacts(repo, run_id_str, run_dir)
-
-            bar.text = (
-                f"{art_count} artifact{'s' if art_count != 1 else ''} → {run_dir}"
-            )
+            _download_job_logs(repo, jobs_to_download, run_dir, run_id, bar=bar)
+            bar.text = str(run_dir)
 
         logger.info("download_complete", run_id=run_id, path=str(run_dir))
     except BaseException:

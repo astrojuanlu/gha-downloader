@@ -1,7 +1,10 @@
+from unittest import mock
+
 import pytest
 
 import gha_downloader.cli as cli_mod
 from gha_downloader.cli import _parse_run_id, build_download_parser
+from gha_downloader.gh import ArtifactData
 
 
 def test_url_repo_inference(monkeypatch):
@@ -204,3 +207,75 @@ def test_main_download_reaches_download_run(monkeypatch):
     cli_mod.main_download()
     assert captured[0]["run_id"] == 12345
     assert captured[0]["repo"] == "myorg/myrepo"
+
+
+class TestListArtifactsJobFilter:
+    def test_job_id_filters_artifacts(self, monkeypatch, capsys):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
+        )
+        art2 = ArtifactData.model_validate(
+            {"id": 200, "name": "build-logs", "size_in_bytes": 1024, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.cli.get_artifacts",
+            mock.Mock(return_value=[art1, art2]),
+        )
+        monkeypatch.setattr(
+            "gha_downloader.cli.get_log_text",
+            mock.Mock(return_value="Artifact ID is 100\n"),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-download", "12345", "--list-artifacts", "--job-id", "42"],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.main_download()
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "test-results" in out
+        assert "build-logs" not in out
+
+    def test_job_id_no_artifact_ids_empty_output(self, monkeypatch, capsys):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.cli.get_artifacts",
+            mock.Mock(return_value=[art1]),
+        )
+        monkeypatch.setattr(
+            "gha_downloader.cli.get_log_text",
+            mock.Mock(return_value="no artifact lines here\n"),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-download", "12345", "--list-artifacts", "--job-id", "42"],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.main_download()
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert out == ""
+
+    def test_no_job_id_returns_full_list(self, monkeypatch, capsys):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
+        )
+        art2 = ArtifactData.model_validate(
+            {"id": 200, "name": "build-logs", "size_in_bytes": 1024, "expired": False}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.cli.get_artifacts",
+            mock.Mock(return_value=[art1, art2]),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-download", "12345", "--list-artifacts"],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.main_download()
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "test-results" in out
+        assert "build-logs" in out
