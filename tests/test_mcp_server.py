@@ -21,6 +21,7 @@ from gha_downloader.mcp_server import (
     list_logs,
     list_run_files,
     read_artifact_file,
+    read_log_file,
     search_log,
 )
 
@@ -128,7 +129,7 @@ class TestListArtifacts:
             mock.Mock(return_value=[art]),
         )
 
-        result = list_artifacts(12345, repo="org/repo")
+        result = list_artifacts(12345, repo="org/repo", only_available=False)
         assert result[0]["expired"] is True
 
     def test_artifact_slug_present(self, monkeypatch):
@@ -194,6 +195,54 @@ class TestListArtifacts:
         result = list_artifacts(12345, repo="org/repo")
         assert len(result) == 2
 
+    def test_expired_excluded_by_default(self, monkeypatch):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "fresh", "size_in_bytes": 1024, "expired": False}
+        )
+        art2 = ArtifactData.model_validate(
+            {"id": 200, "name": "old", "size_in_bytes": 512, "expired": True}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art1, art2]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo")
+        assert len(result) == 1
+        assert result[0]["name"] == "fresh"
+
+    def test_expired_included_with_only_available_false(self, monkeypatch):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "fresh", "size_in_bytes": 1024, "expired": False}
+        )
+        art2 = ArtifactData.model_validate(
+            {"id": 200, "name": "old", "size_in_bytes": 512, "expired": True}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art1, art2]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo", only_available=False)
+        assert len(result) == 2
+
+    def test_no_arg_returns_available_only(self, monkeypatch):
+        art1 = ArtifactData.model_validate(
+            {"id": 100, "name": "fresh", "size_in_bytes": 1024, "expired": False}
+        )
+        art2 = ArtifactData.model_validate(
+            {"id": 200, "name": "old", "size_in_bytes": 512, "expired": True}
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server.get_artifacts",
+            mock.Mock(return_value=[art1, art2]),
+        )
+
+        result = list_artifacts(12345, repo="org/repo")
+        names = [r["name"] for r in result]
+        assert "fresh" in names
+        assert "old" not in names
+
 
 class TestDownloadRun:
     def test_success(self, monkeypatch):
@@ -202,7 +251,7 @@ class TestDownloadRun:
             mock.Mock(),
         )
 
-        result = download_run(12345, repo="org/repo")
+        result = download_run(12345, job_id=None, repo="org/repo")
         assert "12345" in result
         assert "cached" not in result
 
@@ -210,7 +259,7 @@ class TestDownloadRun:
         run_dir = tmp_path / "12345"
         run_dir.mkdir()
 
-        result = download_run(12345, output_dir=str(tmp_path))
+        result = download_run(12345, job_id=None, output_dir=str(tmp_path))
         assert "12345" in result
         assert "cached" in result
 
@@ -222,7 +271,9 @@ class TestDownloadRun:
             mock.Mock(),
         )
 
-        result = download_run(12345, output_dir=str(tmp_path), force=True)
+        result = download_run(
+            12345, job_id=None, output_dir=str(tmp_path), force=True
+        )
         assert "cached" not in result
 
     def test_gh_error(self, monkeypatch):
@@ -232,7 +283,60 @@ class TestDownloadRun:
         )
 
         with pytest.raises(ToolError, match="not found"):
-            download_run(12345, repo="org/repo")
+            download_run(12345, job_id=None, repo="org/repo")
+
+    def test_large_run_includes_note(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
+        jobs = [{"name": f"job-{i}"} for i in range(25)]
+        (run_dir / "run.json").write_text(
+            '{"jobs": '
+            + str(jobs).replace("'", '"')
+            + "}"
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server._download_run",
+            mock.Mock(),
+        )
+
+        result = download_run(
+            12345, job_id=None, output_dir=str(tmp_path), force=True
+        )
+        assert "Note:" in result
+        assert "25 jobs" in result
+
+    def test_small_run_no_note(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
+        (run_dir / "run.json").write_text('{"jobs": [{"name": "job-1"}]}')
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server._download_run",
+            mock.Mock(),
+        )
+
+        result = download_run(
+            12345, job_id=None, output_dir=str(tmp_path), force=True
+        )
+        assert "Note:" not in result
+
+    def test_specific_job_id_no_note(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "12345"
+        run_dir.mkdir()
+        jobs = [{"name": f"job-{i}"} for i in range(25)]
+        (run_dir / "run.json").write_text(
+            '{"jobs": '
+            + str(jobs).replace("'", '"')
+            + "}"
+        )
+        monkeypatch.setattr(
+            "gha_downloader.mcp_server._download_run",
+            mock.Mock(),
+        )
+
+        result = download_run(
+            12345, job_id=42, output_dir=str(tmp_path), force=True
+        )
+        assert "Note:" not in result
 
 
 class TestListRunFiles:
@@ -391,6 +495,124 @@ class TestReadArtifactFile:
                 12345,
                 artifact_slug="my-artifact",
                 file_path="missing.txt",
+                output_dir=str(tmp_path),
+            )
+
+    def test_ansi_stripped_by_default(self, tmp_path):
+        art_dir = tmp_path / "12345" / "artifacts" / "my-artifact"
+        art_dir.mkdir(parents=True)
+        (art_dir / "log.txt").write_text(
+            "\x1b[31mError\x1b[0m: something failed\n"
+        )
+
+        result = read_artifact_file(
+            12345,
+            artifact_slug="my-artifact",
+            file_path="log.txt",
+            output_dir=str(tmp_path),
+        )
+        assert result == "Error: something failed\n"
+
+    def test_ansi_preserved_with_raw_true(self, tmp_path):
+        art_dir = tmp_path / "12345" / "artifacts" / "my-artifact"
+        art_dir.mkdir(parents=True)
+        raw_content = "\x1b[31mError\x1b[0m: something failed\n"
+        (art_dir / "log.txt").write_text(raw_content)
+
+        result = read_artifact_file(
+            12345,
+            artifact_slug="my-artifact",
+            file_path="log.txt",
+            output_dir=str(tmp_path),
+            raw=True,
+        )
+        assert result == raw_content
+
+    def test_no_ansi_unaffected(self, tmp_path):
+        art_dir = tmp_path / "12345" / "artifacts" / "my-artifact"
+        art_dir.mkdir(parents=True)
+        (art_dir / "clean.txt").write_text("clean content\n")
+
+        result = read_artifact_file(
+            12345,
+            artifact_slug="my-artifact",
+            file_path="clean.txt",
+            output_dir=str(tmp_path),
+        )
+        assert result == "clean content\n"
+
+
+class TestReadLogFile:
+    def test_read_full_log(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("line1\nline2\nline3\n")
+
+        result = read_log_file(
+            12345, job_slug="build-job", output_dir=str(tmp_path)
+        )
+        assert result.startswith("# Lines 1–3 of 3")
+        assert "line1" in result
+        assert "line3" in result
+
+    def test_read_step_file(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("full\n")
+        (job_dir / "01_checkout.txt").write_text("checkout output\n")
+
+        result = read_log_file(
+            12345,
+            job_slug="build-job",
+            step_label="01_checkout",
+            output_dir=str(tmp_path),
+        )
+        assert "checkout output" in result
+
+    def test_pagination(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        lines = [f"line{i}" for i in range(100)]
+        (job_dir / "full.log").write_text("\n".join(lines))
+
+        result = read_log_file(
+            12345,
+            job_slug="build-job",
+            offset=10,
+            limit=5,
+            output_dir=str(tmp_path),
+        )
+        assert result.startswith("# Lines 11–15 of 100")
+        assert "line10" in result
+        assert "line14" in result
+
+    def test_run_not_downloaded(self, tmp_path):
+        with pytest.raises(ToolError, match="No logs directory"):
+            read_log_file(
+                12345, job_slug="build-job", output_dir=str(tmp_path)
+            )
+
+    def test_bad_job_slug(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "real-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("log\n")
+
+        with pytest.raises(ToolError, match="not found"):
+            read_log_file(
+                12345, job_slug="bad-job", output_dir=str(tmp_path)
+            )
+
+    def test_bad_step_label(self, tmp_path):
+        job_dir = tmp_path / "12345" / "logs" / "build-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "full.log").write_text("log\n")
+        (job_dir / "01_checkout.txt").write_text("step\n")
+
+        with pytest.raises(ToolError, match="not found"):
+            read_log_file(
+                12345,
+                job_slug="build-job",
+                step_label="99_missing",
                 output_dir=str(tmp_path),
             )
 

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -32,9 +33,9 @@ mcp = FastMCP(
         "2. download_run(job_id=<id>) — download only that job's logs "
         "(faster, avoids timeouts on large runs)\n"
         "3. list_logs(run_id=<id>) — list available job slugs with steps\n"
-        "4. Read log content using native file-read tools at "
-        "<run_dir>/logs/<job_slug>/full.log or "
-        "<run_dir>/logs/<job_slug>/<step_label>.txt\n"
+        "4. read_log_file(run_id=<id>, job_slug=<slug>) — read log "
+        "content (or use native file-read tools at "
+        "<run_dir>/logs/<job_slug>/full.log)\n"
         "\n"
         "For artifacts: list_artifacts → download_artifact(slug) → "
         "read_artifact_file.\n"
@@ -64,6 +65,10 @@ _ANN_WRITE = ToolAnnotations(
 _ANN_LOCAL_READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
 )
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[mGKHFJABCDsu]")
+
+_LARGE_RUN_JOB_THRESHOLD = 20
 
 
 @mcp.tool(annotations=_ANN_READ_ONLY)
@@ -141,8 +146,11 @@ def get_run_info(
 
 
 @mcp.tool(annotations=_ANN_READ_ONLY)
-def list_artifacts(
-    run_id: int, repo: str | None = None, job_id: int | None = None
+def list_artifacts(  # noqa: PLR0913
+    run_id: int,
+    repo: str | None = None,
+    job_id: int | None = None,
+    only_available: bool = True,
 ) -> list[dict]:
     """List artifacts for a GitHub Actions run without downloading them.
 
@@ -154,6 +162,9 @@ def list_artifacts(
             this job are returned (determined by parsing the job log
             for ``Artifact ID is`` messages). When ``None``, all
             run artifacts are returned.
+        only_available: When ``True`` (default), expired artifacts
+            are excluded from the returned list. When ``False``,
+            all artifacts (including expired) are returned.
 
     Returns:
         List of artifact records with id, name, size_in_bytes,
@@ -172,6 +183,8 @@ def list_artifacts(
             log_text = get_log_text(repo, job_id)
             id_set = set(_extract_artifact_ids(log_text))
             artifacts = [a for a in artifacts if a.artifact_id in id_set]
+        if only_available:
+            artifacts = [a for a in artifacts if not a.expired]
         result = [a.model_dump(mode="json") for a in artifacts]
         for artifact in result:
             artifact["artifact_slug"] = slugify(artifact["name"])
@@ -182,11 +195,11 @@ def list_artifacts(
         raise ToolError(str(exc)) from exc
 
 
-@mcp.tool(annotations=_ANN_DESTRUCTIVE)
+@mcp.tool(annotations=_ANN_WRITE)
 def download_run(
     run_id: int,
+    job_id: int | None,
     repo: str | None = None,
-    job_id: int | None = None,
     output_dir: str | None = None,
     force: bool = False,
 ) -> str:
@@ -196,17 +209,22 @@ def download_run(
     Use ``list_artifacts`` to discover available artifacts and
     ``download_artifact`` to download individual ones.
 
-    Passing ``job_id`` restricts the download to a single job's logs,
-    which is significantly faster and avoids timeouts on large runs.
+    ``job_id`` is a required parameter. Pass ``job_id=None`` to
+    download all jobs' logs, or pass a specific integer ``job_id``
+    to download a single job (significantly faster on large runs).
+    When ``job_id=None`` and the run has more than 20 jobs, the
+    return value includes a note recommending targeted ``job_id``
+    use.
 
     When the run directory already exists and ``force`` is ``False``,
     returns the cached path immediately without re-downloading.
 
     Args:
         run_id: Numeric workflow run ID.
+        job_id: Required. Pass ``None`` to download all jobs, or a
+            specific integer job ID to download only that job.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
             inside a git clone.
-        job_id: Only download logs for this job ID.
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
@@ -214,7 +232,9 @@ def download_run(
 
     Returns:
         The absolute path of the run directory on success. Appends
-        ``(cached)`` when the directory already existed.
+        ``(cached)`` when the directory already existed. When
+        ``job_id=None`` and the run has more than 20 jobs, appends
+        a note recommending the use of a specific ``job_id``.
 
     Raises:
         ToolError: If the run is not found or the repo cannot be
@@ -233,7 +253,19 @@ def download_run(
             output_dir=output_dir,
             force=force,
         )
-        return str((Path(output_dir) / str(run_id)).resolve())
+        result = str((Path(output_dir) / str(run_id)).resolve())
+        if job_id is None:
+            run_json_path = Path(output_dir) / str(run_id) / "run.json"
+            if run_json_path.is_file():
+                run_data = json.loads(run_json_path.read_text())
+                job_count = len(run_data.get("jobs") or [])
+                if job_count > _LARGE_RUN_JOB_THRESHOLD:
+                    result += (
+                        f"\nNote: downloaded {job_count} jobs. "
+                        "For large runs, pass job_id=<id> to "
+                        "download a single job's logs."
+                    )
+        return result
     except DownloaderError as exc:
         raise ToolError(str(exc)) from exc
     except GhError as exc:
@@ -405,11 +437,91 @@ def list_logs(run_id: int, output_dir: str | None = None) -> str:
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
+def read_log_file(  # noqa: PLR0913
+    run_id: int,
+    job_slug: str,
+    step_label: str | None = None,
+    offset: int = 0,
+    limit: int = 500,
+    output_dir: str | None = None,
+) -> str:
+    """Read the content of a downloaded log file.
+
+    When ``step_label`` is ``None``, reads
+    ``logs/<job_slug>/full.log``; when provided, reads
+    ``logs/<job_slug>/<step_label>.txt``. Use ``list_logs`` to
+    discover available ``job_slug`` and ``step_label`` values.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        job_slug: Filesystem-safe slug of the job.
+        step_label: Step label within the job. When ``None``, reads
+            the full job log.
+        offset: 0-indexed first line to return (default 0).
+        limit: Maximum number of lines to return (default 500).
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+
+    Returns:
+        A header line ``# Lines <start>–<end> of <total>``
+        followed by the requested lines.
+
+    Raises:
+        ToolError: If the run is not downloaded, ``job_slug`` is
+            not found, or ``step_label`` is set but the file does
+            not exist.
+    """
+    if output_dir is None:
+        output_dir = _default_output_dir()
+    run_dir = Path(output_dir) / str(run_id)
+    logs_dir = run_dir / "logs"
+
+    if not logs_dir.is_dir():
+        raise ToolError(
+            f"No logs directory for run {run_id}. "
+            "Download the run first with download_run."
+        )
+
+    job_dir = logs_dir / job_slug
+    if not job_dir.is_dir():
+        available = sorted(d.name for d in logs_dir.iterdir() if d.is_dir())
+        raise ToolError(
+            f"Job slug '{job_slug}' not found in run {run_id}. "
+            f"Available slugs: {', '.join(available)}"
+        )
+
+    if step_label is None:
+        target = job_dir / "full.log"
+    else:
+        target = job_dir / f"{step_label}.txt"
+
+    if not target.is_file():
+        step_files = sorted(
+            p.stem for p in job_dir.iterdir() if p.is_file() and p.suffix == ".txt"
+        )
+        raise ToolError(
+            f"Log file for step '{step_label}' not found for job "
+            f"'{job_slug}' in run {run_id}. "
+            f"Available steps: {', '.join(step_files)}"
+        )
+
+    all_lines = target.read_text(encoding="utf-8").splitlines()
+    total = len(all_lines)
+    start = offset
+    end = min(start + limit, total)
+    selected = all_lines[start:end]
+    header = f"# Lines {start + 1}–{end} of {total}"
+    return header + "\n" + "\n".join(selected)
+
+
+@mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
 def read_artifact_file(
     run_id: int,
     artifact_slug: str,
     file_path: str,
     output_dir: str | None = None,
+    raw: bool = False,
 ) -> str:
     """Read the text content of a file inside a downloaded artifact directory.
 
@@ -422,9 +534,13 @@ def read_artifact_file(
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
+        raw: When ``False`` (default), ANSI escape sequences are
+            stripped from the returned text. When ``True``, the
+            raw content is returned as-is.
 
     Returns:
-        The file content as UTF-8 text.
+        The file content as UTF-8 text (ANSI-stripped unless
+        ``raw=True``).
 
     Raises:
         ToolError: If the artifact directory does not exist, the file
@@ -458,11 +574,15 @@ def read_artifact_file(
         )
 
     try:
-        return target.read_text(encoding="utf-8")
+        text = target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         raise ToolError(
             f"File '{file_path}' is binary and cannot be returned as text."
         ) from None
+
+    if not raw:
+        text = _ANSI_ESCAPE_RE.sub("", text)
+    return text
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)

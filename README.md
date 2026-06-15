@@ -156,11 +156,12 @@ Use it with any MCP-compatible client (e.g. Claude Desktop, OpenCode).
 |------|-------------|
 | `get_run_info` | Fetch run metadata and job list without downloading. Pass `include_steps=True` for per-step detail with `step_label` values. Pass `only_failed=True` to return only non-successful jobs (useful for large matrix runs). |
 | `list_artifacts` | List artifact names, sizes, and expiry status for a run. Pass `job_id` to list only artifacts uploaded by a specific job. |
-| `download_run` | Download logs and `run.json` for a run to disk. Pass `job_id` to download a single job (faster). Cached on re-invocation; pass `force=True` to re-download. |
+| `download_run` | Download logs and `run.json` for a run to disk. `job_id` is required — pass a specific ID or `None` for all jobs. Cached on re-invocation; pass `force=True` to re-download. Returns a note on large runs (>20 jobs) when `job_id=None`. |
 | `list_run_files` | Enumerate downloaded files for a run (logs + artifacts) |
-| `list_logs` | List downloaded job slugs and their step labels. Use before `search_log` to discover available `job_slug` values. Does not return log content. |
+| `list_logs` | List downloaded job slugs and their step labels. Use before `search_log` or `read_log_file` to discover available `job_slug` values. Does not return log content. |
 | `search_log` | Search downloaded logs for lines matching a regex. Pass `job_slug` to scope to one job, `step_label` to scope to one step, `context_lines` for surrounding context. |
-| `read_artifact_file` | Return the text content of a file inside a downloaded artifact |
+| `read_log_file` | Read content of a downloaded log file by job slug and optional step label. Supports pagination with `offset` and `limit`. |
+| `read_artifact_file` | Return the text content of a file inside a downloaded artifact. ANSI escape codes are stripped by default; pass `raw=True` to preserve them. |
 
 ## Development
 
