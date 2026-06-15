@@ -1,26 +1,28 @@
 import argparse
+import json
 import logging as _logging
 import re
 import signal
 import sys
-from pathlib import Path
 
 import structlog
 
 from . import repo as repo_module
-from .downloader import DownloaderError, _extract_artifact_ids, download_run, slugify
+from .downloader import (
+    DownloaderError,
+    download_all_jobs_from_run,
+    download_artifact,
+    download_job,
+    get_run_info,
+    list_artifacts,
+    slugify,
+)
 from .gh import (
     GhAutoDetectError,
-    GhExpiredArtifactError,
     GhNetworkError,
     GhNotFoundError,
     GhNotInstalledError,
     GhSpawnError,
-    get_artifacts,
-    get_log_text,
-)
-from .gh import (
-    download_artifact as gh_download_artifact,
 )
 
 logger = structlog.get_logger()
@@ -65,11 +67,16 @@ def configure_logging(verbosity: int) -> None:
 def build_download_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gha-download",
-        description="Download logs and artifacts from GitHub Actions runs.",
+        description="Download logs for a single job from a GitHub Actions run.",
     )
     parser.add_argument(
         "run_id",
         help="Numeric workflow run ID or full Actions URL.",
+    )
+    parser.add_argument(
+        "job_id",
+        type=int,
+        help="Numeric job ID.",
     )
     parser.add_argument(
         "--repo",
@@ -77,19 +84,9 @@ def build_download_parser() -> argparse.ArgumentParser:
         type=validate_repo_arg,
     )
     parser.add_argument(
-        "--job-id",
-        type=int,
-        help="Only download logs and artifacts for this job ID.",
-    )
-    parser.add_argument(
         "--dir",
         default="./runs",
         help="Root directory for downloads (default: ./runs).",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite existing run directory.",
     )
     parser.add_argument(
         "-v",
@@ -97,18 +94,6 @@ def build_download_parser() -> argparse.ArgumentParser:
         action="count",
         default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG).",
-    )
-    parser.add_argument(
-        "--list-artifacts",
-        action="store_true",
-        help="List artifacts for the run (name, size, status, slug) and exit.",
-    )
-    parser.add_argument(
-        "--artifact",
-        action="append",
-        metavar="NAME",
-        dest="artifacts",
-        help="Download a named artifact. Repeatable.",
     )
     return parser
 
@@ -131,102 +116,39 @@ def _format_size(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
-def _list_artifacts_cmd(
-    run_id: int,
-    repo: str | None,
-    args: argparse.Namespace,
-    job_id: int | None = None,
-) -> None:
+def _parse_run_id(raw: str) -> tuple[int, str | None]:
     try:
-        artifacts = get_artifacts(str(run_id), repo=repo)
-    except GhNotFoundError:
-        artifacts = []
-    except GhNotInstalledError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(2)
-    except (GhNetworkError, GhSpawnError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(3)
-    if job_id is not None:
-        try:
-            log_text = get_log_text(repo, job_id)
-        except GhNotFoundError:
-            print(f"Error: job {job_id} not found.", file=sys.stderr)
+        return int(raw), None
+    except ValueError:
+        m = re.search(r"/runs/(\d+)", raw)
+        if not m:
+            print(f"Error: Invalid run ID: {raw!r}", file=sys.stderr)
             sys.exit(2)
-        except (GhNetworkError, GhSpawnError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(3)
-        id_set = set(_extract_artifact_ids(log_text))
-        artifacts = [a for a in artifacts if a.artifact_id in id_set]
-        if not id_set:
-            sys.exit(0)
-    for artifact in artifacts:
-        slug = slugify(artifact.name)
-        size = _format_size(artifact.size_in_bytes)
-        status = "expired" if artifact.expired else "available"
-        print(f"{artifact.name}  {size}  {status}  slug: {slug}")
-    sys.exit(0)
+        url_repo: str | None = None
+        repo_match = re.search(r"github\.com/([^/]+/[^/]+)/actions/", raw)
+        if repo_match:
+            url_repo = repo_match.group(1)
+        return int(m.group(1)), url_repo
 
 
-def _download_artifact_cmd(
-    run_id: int,
-    repo: str | None,
-    name: str,
-    args: argparse.Namespace,
-) -> None:
-    try:
-        artifacts = get_artifacts(str(run_id), repo=repo)
-    except GhNotFoundError:
-        print(
-            f"Error: artifact '{name}' not found. No artifacts exist for this run.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    except GhNotInstalledError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(2)
-    except (GhNetworkError, GhSpawnError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(3)
+def main_download() -> None:
+    signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))
 
-    matched = next((a for a in artifacts if a.name == name), None)
-    if matched is None:
-        available = ", ".join(a.name for a in artifacts) or "(none)"
-        print(
-            f"Error: artifact '{name}' not found. Available: {available}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if matched.expired:
-        print(f"Error: artifact '{name}' has expired.", file=sys.stderr)
-        sys.exit(2)
+    parser = build_download_parser()
+    args = parser.parse_args()
 
-    run_dir = Path(args.dir) / str(run_id)
-    art_slug = slugify(matched.name)
-    art_dir = run_dir / "artifacts" / art_slug
-    art_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging(args.verbose)
+
+    run_id, url_repo = _parse_run_id(args.run_id)
+    if args.repo is None and url_repo is not None:
+        args.repo = repo_module.validate_repo(url_repo)
 
     try:
-        gh_download_artifact(str(run_id), matched.name, str(art_dir), repo=repo)
-    except GhExpiredArtifactError:
-        print(f"Error: artifact '{name}' has expired.", file=sys.stderr)
-        sys.exit(2)
-    except GhNotInstalledError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(2)
-    except (GhNetworkError, GhSpawnError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(3)
-
-
-def _run_download(args: argparse.Namespace, url_repo: str | None) -> None:
-    try:
-        download_run(
-            run_id=int(args.run_id) if isinstance(args.run_id, int) else args.run_id,
-            repo=args.repo,
+        download_job(
+            run_id=run_id,
             job_id=args.job_id,
+            repo=args.repo,
             output_dir=args.dir,
-            force=args.force,
         )
     except SystemExit:
         raise
@@ -251,61 +173,189 @@ def _run_download(args: argparse.Namespace, url_repo: str | None) -> None:
         sys.exit(1)
 
 
-def _parse_run_id(raw: str) -> tuple[int, str | None, int | None]:
+def build_downloader_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gha-downloader",
+        description="Inspect and download GitHub Actions runs, jobs, and artifacts.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v for INFO, -vv for DEBUG).",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Run operations")
+    run_sub = run_parser.add_subparsers(dest="run_command", required=True)
+
+    run_show = run_sub.add_parser("show", help="Show run metadata")
+    run_show.add_argument("run_id", type=int, help="Numeric workflow run ID.")
+    run_show.add_argument("--repo", help="Repository in ORG/REPO format.")
+    run_show.add_argument(
+        "--include-steps", action="store_true", help="Include step details."
+    )
+    run_show.add_argument(
+        "--only-failed", action="store_true", help="Show only failed jobs."
+    )
+    run_show.add_argument(
+        "--json", action="store_true", dest="json_output", help="JSON output (default)."
+    )
+
+    run_download = run_sub.add_parser("download", help="Download all job logs")
+    run_download.add_argument("run_id", type=int, help="Numeric workflow run ID.")
+    run_download.add_argument("--repo", help="Repository in ORG/REPO format.")
+    run_download.add_argument(
+        "--dir", default="./runs", help="Root directory for downloads."
+    )
+    run_download.add_argument(
+        "--force", action="store_true", help="Overwrite existing directory."
+    )
+
+    job_parser = subparsers.add_parser("job", help="Job operations")
+    job_sub = job_parser.add_subparsers(dest="job_command", required=True)
+
+    job_download = job_sub.add_parser("download", help="Download a single job")
+    job_download.add_argument("run_id", type=int, help="Numeric workflow run ID.")
+    job_download.add_argument("job_id", type=int, help="Numeric job ID.")
+    job_download.add_argument("--repo", help="Repository in ORG/REPO format.")
+    job_download.add_argument(
+        "--dir", default="./runs", help="Root directory for downloads."
+    )
+    job_download.add_argument(
+        "--force", action="store_true", help="Overwrite existing directory."
+    )
+
+    artifact_parser = subparsers.add_parser("artifact", help="Artifact operations")
+    artifact_sub = artifact_parser.add_subparsers(
+        dest="artifact_command", required=True
+    )
+
+    artifact_list = artifact_sub.add_parser("list", help="List artifacts")
+    artifact_list.add_argument("run_id", type=int, help="Numeric workflow run ID.")
+    artifact_list.add_argument("--repo", help="Repository in ORG/REPO format.")
+    artifact_list.add_argument(
+        "--job-id", type=int, default=None, help="Filter by job ID."
+    )
+    artifact_list.add_argument(
+        "--all", action="store_true", dest="show_all", help="Include expired artifacts."
+    )
+
+    artifact_download = artifact_sub.add_parser("download", help="Download artifact")
+    artifact_download.add_argument("run_id", type=int, help="Numeric workflow run ID.")
+    artifact_download.add_argument("artifact_name", help="Artifact name (not slug).")
+    artifact_download.add_argument("--repo", help="Repository in ORG/REPO format.")
+    artifact_download.add_argument(
+        "--dir", default="./runs", help="Root directory for downloads."
+    )
+
+    return parser
+
+
+def _cmd_run_show(args: argparse.Namespace) -> None:
     try:
-        return int(raw), None, None
-    except ValueError:
-        m = re.search(r"/runs/(\d+)", raw)
-        if not m:
-            print(f"Error: Invalid run ID: {raw!r}", file=sys.stderr)
-            sys.exit(2)
-        url_repo: str | None = None
-        repo_match = re.search(r"github\.com/([^/]+/[^/]+)/actions/", raw)
-        if repo_match:
-            url_repo = repo_match.group(1)
-        job_id: int | None = None
-        jm = re.search(r"/job/(\d+)", raw)
-        if jm:
-            job_id = int(jm.group(1))
-        return int(m.group(1)), url_repo, job_id
+        result = get_run_info(
+            run_id=args.run_id,
+            repo=args.repo,
+            include_steps=args.include_steps,
+            only_failed=args.only_failed,
+        )
+    except DownloaderError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(result, indent=2))
 
 
-def main_download() -> None:
+def _cmd_run_download(args: argparse.Namespace) -> None:
+    try:
+        run_dir = download_all_jobs_from_run(
+            run_id=args.run_id,
+            repo=args.repo,
+            output_dir=args.dir,
+            force=args.force,
+        )
+    except DownloaderError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except (GhNetworkError, GhSpawnError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(3)
+    print(run_dir)
+
+
+def _cmd_job_download(args: argparse.Namespace) -> None:
+    try:
+        run_dir = download_job(
+            run_id=args.run_id,
+            job_id=args.job_id,
+            repo=args.repo,
+            output_dir=args.dir,
+            force=args.force,
+        )
+    except DownloaderError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except (GhNetworkError, GhSpawnError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(3)
+    print(run_dir)
+
+
+def _cmd_artifact_list(args: argparse.Namespace) -> None:
+    try:
+        artifacts = list_artifacts(
+            run_id=args.run_id,
+            repo=args.repo,
+            job_id=args.job_id,
+            only_available=not args.show_all,
+        )
+    except DownloaderError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    for art in artifacts:
+        size = _format_size(art["size_in_bytes"])
+        status = "expired" if art["expired"] else "available"
+        slug = art["artifact_slug"]
+        print(f"{art['name']}  {size}  {status}  slug: {slug}")
+
+
+def _cmd_artifact_download(args: argparse.Namespace) -> None:
+    art_slug = slugify(args.artifact_name)
+    try:
+        art_dir = download_artifact(
+            run_id=args.run_id,
+            artifact_slug=art_slug,
+            repo=args.repo,
+            output_dir=args.dir,
+        )
+    except DownloaderError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except (GhNetworkError, GhSpawnError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(3)
+    print(art_dir)
+
+
+def main_downloader() -> None:
     signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))
 
-    parser = build_download_parser()
+    parser = build_downloader_parser()
     args = parser.parse_args()
 
     configure_logging(args.verbose)
 
-    run_id, url_repo, url_job_id = _parse_run_id(args.run_id)
-    args.run_id = run_id
-    if args.job_id is None and url_job_id is not None:
-        args.job_id = url_job_id
-    elif (
-        args.job_id is not None and url_job_id is not None and args.job_id != url_job_id
-    ):
-        print(
-            f"Warning: --job-id {args.job_id} overrides job ID {url_job_id} from URL.",
-            file=sys.stderr,
-        )
-    if args.repo is None and url_repo is not None:
-        args.repo = repo_module.validate_repo(url_repo)
-
-    if args.list_artifacts and args.artifacts:
-        print(
-            "Error: --list-artifacts and --artifact are mutually exclusive.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    if args.list_artifacts:
-        _list_artifacts_cmd(run_id, args.repo, args, job_id=args.job_id)
-        return  # _list_artifacts_cmd exits, but satisfy type checkers
-
-    if args.artifacts:
-        for name in args.artifacts:
-            _download_artifact_cmd(run_id, args.repo, name, args)
-        return
-
-    _run_download(args, url_repo)
+    if args.command == "run":
+        if args.run_command == "show":
+            _cmd_run_show(args)
+        elif args.run_command == "download":
+            _cmd_run_download(args)
+    elif args.command == "job":
+        if args.job_command == "download":
+            _cmd_job_download(args)
+    elif args.command == "artifact":
+        if args.artifact_command == "list":
+            _cmd_artifact_list(args)
+        elif args.artifact_command == "download":
+            _cmd_artifact_download(args)

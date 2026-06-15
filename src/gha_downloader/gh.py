@@ -139,7 +139,11 @@ def find_gh() -> str:
     return gh
 
 
-def run_gh(args: list[str], retries: int = 3) -> subprocess.CompletedProcess:
+def run_gh(
+    args: list[str],
+    retries: int = 3,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess:
     gh = find_gh()
     cmd = [gh, *args]
 
@@ -152,7 +156,10 @@ def run_gh(args: list[str], retries: int = 3) -> subprocess.CompletedProcess:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            raise GhNetworkError(f"gh command timed out after {timeout}s") from None
         except OSError as e:
             last_exc = e
             logger.debug("gh_spawn_failed", error=str(e), attempt=attempt)

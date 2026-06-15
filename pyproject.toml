@@ -26,6 +26,7 @@ mcp = [
 
 [project.scripts]
 gha-download = "gha_downloader.cli:main_download"
+gha-downloader = "gha_downloader.cli:main_downloader"
 gha-downloader-mcp = "gha_downloader.mcp_server:main_mcp"
 
 [dependency-groups]

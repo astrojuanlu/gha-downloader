@@ -3,24 +3,27 @@ from unittest import mock
 import pytest
 
 import gha_downloader.cli as cli_mod
-from gha_downloader.cli import _parse_run_id, build_download_parser
-from gha_downloader.gh import ArtifactData
+from gha_downloader.cli import (
+    _parse_run_id,
+    build_download_parser,
+    build_downloader_parser,
+)
+from gha_downloader.downloader import DownloaderError
 
 
 def test_url_repo_inference(monkeypatch):
     captured_repo: list[str | None] = []
 
-    def fake_download_run(
-        run_id, repo=None, job_id=None, output_dir="./runs", force=False
-    ):
+    def fake_download_job(run_id, job_id, repo=None, output_dir=None, force=False):
         captured_repo.append(repo)
 
-    monkeypatch.setattr(cli_mod, "download_run", fake_download_run)
+    monkeypatch.setattr(cli_mod, "download_job", fake_download_job)
     monkeypatch.setattr(
         "sys.argv",
         [
             "gha-download",
             "https://github.com/myorg/myrepo/actions/runs/12345",
+            "99",
         ],
     )
     cli_mod.main_download()
@@ -30,17 +33,16 @@ def test_url_repo_inference(monkeypatch):
 def test_url_repo_explicit_overrides(monkeypatch):
     captured_repo: list[str | None] = []
 
-    def fake_download_run(
-        run_id, repo=None, job_id=None, output_dir="./runs", force=False
-    ):
+    def fake_download_job(run_id, job_id, repo=None, output_dir=None, force=False):
         captured_repo.append(repo)
 
-    monkeypatch.setattr(cli_mod, "download_run", fake_download_run)
+    monkeypatch.setattr(cli_mod, "download_job", fake_download_job)
     monkeypatch.setattr(
         "sys.argv",
         [
             "gha-download",
             "https://github.com/other/repo/actions/runs/12345",
+            "99",
             "--repo",
             "explicit/repo",
         ],
@@ -49,120 +51,45 @@ def test_url_repo_explicit_overrides(monkeypatch):
     assert captured_repo[0] == "explicit/repo"
 
 
-def test_parse_run_id_url_with_job_and_query():
-    run_id, url_repo, url_job_id = _parse_run_id(
-        "https://github.com/org/repo/actions/runs/12345/job/999?pr=354"
-    )
-    assert run_id == 12345
-    assert url_repo == "org/repo"
-    assert url_job_id == 999
-
-
-def test_parse_run_id_url_with_query_only():
-    run_id, url_repo, url_job_id = _parse_run_id(
+def test_parse_run_id_url_with_query():
+    run_id, url_repo = _parse_run_id(
         "https://github.com/org/repo/actions/runs/12345?pr=354"
     )
     assert run_id == 12345
     assert url_repo == "org/repo"
-    assert url_job_id is None
-
-
-def test_parse_run_id_url_with_job_no_query():
-    run_id, url_repo, url_job_id = _parse_run_id(
-        "https://github.com/org/repo/actions/runs/12345/job/42"
-    )
-    assert run_id == 12345
-    assert url_repo == "org/repo"
-    assert url_job_id == 42
 
 
 def test_parse_run_id_numeric():
-    run_id, url_repo, url_job_id = _parse_run_id("12345")
+    run_id, url_repo = _parse_run_id("12345")
     assert run_id == 12345
     assert url_repo is None
-    assert url_job_id is None
 
 
-def test_job_id_conflict_warning(monkeypatch, capsys):
+def test_main_download_reaches_service(monkeypatch):
     captured: list[dict] = []
 
-    def fake_download_run(
-        run_id, repo=None, job_id=None, output_dir="./runs", force=False
-    ):
-        captured.append({"run_id": run_id, "repo": repo, "job_id": job_id})
+    def fake_download_job(run_id, job_id, repo=None, output_dir=None, force=False):
+        captured.append({"run_id": run_id, "job_id": job_id, "repo": repo})
 
-    monkeypatch.setattr(cli_mod, "download_run", fake_download_run)
+    monkeypatch.setattr(cli_mod, "download_job", fake_download_job)
     monkeypatch.setattr(
         "sys.argv",
-        [
-            "gha-download",
-            "https://github.com/org/repo/actions/runs/12345/job/111",
-            "--job-id",
-            "999",
-        ],
+        ["gha-download", "12345", "42", "--repo", "myorg/myrepo"],
     )
     cli_mod.main_download()
-    assert captured[0]["job_id"] == 999
-    err = capsys.readouterr().err
-    assert "--job-id 999 overrides job ID 111 from URL" in err
-
-
-def test_job_id_no_warning_when_matching(monkeypatch, capsys):
-    captured: list[dict] = []
-
-    def fake_download_run(
-        run_id, repo=None, job_id=None, output_dir="./runs", force=False
-    ):
-        captured.append({"run_id": run_id, "repo": repo, "job_id": job_id})
-
-    monkeypatch.setattr(cli_mod, "download_run", fake_download_run)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "gha-download",
-            "https://github.com/org/repo/actions/runs/12345/job/111",
-            "--job-id",
-            "111",
-        ],
-    )
-    cli_mod.main_download()
-    assert captured[0]["job_id"] == 111
-    err = capsys.readouterr().err
-    assert "overrides" not in err
+    assert captured[0]["run_id"] == 12345
+    assert captured[0]["job_id"] == 42
+    assert captured[0]["repo"] == "myorg/myrepo"
 
 
 def test_flat_parser_minimal():
     parser = build_download_parser()
-    args = parser.parse_args(["12345"])
+    args = parser.parse_args(["12345", "42"])
     assert args.run_id == "12345"
-    assert args.repo is None
-    assert args.job_id is None
-    assert args.dir == "./runs"
-    assert args.force is False
-    assert args.verbose == 0
-
-
-def test_flat_parser_all_flags():
-    parser = build_download_parser()
-    args = parser.parse_args(
-        [
-            "12345",
-            "--repo",
-            "myorg/myrepo",
-            "--job-id",
-            "42",
-            "--dir",
-            "/tmp/out",
-            "--force",
-            "-vv",
-        ]
-    )
-    assert args.run_id == "12345"
-    assert args.repo == "myorg/myrepo"
     assert args.job_id == 42
-    assert args.dir == "/tmp/out"
-    assert args.force is True
-    assert args.verbose == 2
+    assert args.repo is None
+    assert args.dir == "./runs"
+    assert args.verbose == 0
 
 
 def test_flat_parser_missing_run_id():
@@ -171,111 +98,242 @@ def test_flat_parser_missing_run_id():
         parser.parse_args([])
 
 
+def test_flat_parser_missing_job_id():
+    parser = build_download_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["12345"])
+
+
 def test_flat_parser_invalid_repo():
     parser = build_download_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["12345", "--repo", "invalid"])
+        parser.parse_args(["12345", "42", "--repo", "invalid"])
 
 
 def test_flat_parser_verbose_before_run_id():
     parser = build_download_parser()
-    args = parser.parse_args(["-vv", "12345"])
+    args = parser.parse_args(["-vv", "12345", "42"])
     assert args.verbose == 2
     assert args.run_id == "12345"
+    assert args.job_id == 42
 
 
-def test_flat_parser_verbose_after_run_id():
+def test_flat_parser_verbose_after_job_id():
     parser = build_download_parser()
-    args = parser.parse_args(["12345", "-vv"])
+    args = parser.parse_args(["12345", "42", "-vv"])
     assert args.verbose == 2
     assert args.run_id == "12345"
+    assert args.job_id == 42
 
 
-def test_main_download_reaches_download_run(monkeypatch):
-    captured: list[dict] = []
-
-    def fake_download_run(
-        run_id, repo=None, job_id=None, output_dir="./runs", force=False
-    ):
-        captured.append({"run_id": run_id, "repo": repo, "job_id": job_id})
-
-    monkeypatch.setattr(cli_mod, "download_run", fake_download_run)
-    monkeypatch.setattr(
-        "sys.argv",
-        ["gha-download", "12345", "--repo", "myorg/myrepo"],
-    )
-    cli_mod.main_download()
-    assert captured[0]["run_id"] == 12345
-    assert captured[0]["repo"] == "myorg/myrepo"
+def test_force_flag_rejected():
+    parser = build_download_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["12345", "42", "--force"])
 
 
-class TestListArtifactsJobFilter:
-    def test_job_id_filters_artifacts(self, monkeypatch, capsys):
-        art1 = ArtifactData.model_validate(
-            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
-        )
-        art2 = ArtifactData.model_validate(
-            {"id": 200, "name": "build-logs", "size_in_bytes": 1024, "expired": False}
-        )
+def test_list_artifacts_flag_rejected():
+    parser = build_download_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["12345", "42", "--list-artifacts"])
+
+
+def test_artifact_flag_rejected():
+    parser = build_download_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["12345", "42", "--artifact", "name"])
+
+
+class TestDownloaderSubcommands:
+    def test_run_show(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "gha_downloader.cli.get_artifacts",
-            mock.Mock(return_value=[art1, art2]),
-        )
-        monkeypatch.setattr(
-            "gha_downloader.cli.get_log_text",
-            mock.Mock(return_value="Artifact ID is 100\n"),
+            cli_mod,
+            "get_run_info",
+            mock.Mock(return_value={"databaseId": 123, "jobs": []}),
         )
         monkeypatch.setattr(
             "sys.argv",
-            ["gha-download", "12345", "--list-artifacts", "--job-id", "42"],
+            ["gha-downloader", "run", "show", "123"],
+        )
+        cli_mod.main_downloader()
+        out = capsys.readouterr().out
+        assert "123" in out
+
+    def test_run_show_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli_mod,
+            "get_run_info",
+            mock.Mock(side_effect=DownloaderError("not found")),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-downloader", "run", "show", "99999"],
         )
         with pytest.raises(SystemExit) as exc_info:
-            cli_mod.main_download()
-        assert exc_info.value.code == 0
+            cli_mod.main_downloader()
+        assert exc_info.value.code == 2
+
+    def test_run_download(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr(
+            cli_mod,
+            "download_all_jobs_from_run",
+            mock.Mock(return_value=tmp_path / "123"),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-downloader", "run", "download", "123"],
+        )
+        cli_mod.main_downloader()
+        out = capsys.readouterr().out
+        assert "123" in out
+
+    def test_job_download(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.setattr(
+            cli_mod,
+            "download_job",
+            mock.Mock(return_value=tmp_path / "123"),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-downloader", "job", "download", "123", "42"],
+        )
+        cli_mod.main_downloader()
+        out = capsys.readouterr().out
+        assert "123" in out
+
+    def test_artifact_list(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_mod,
+            "list_artifacts",
+            mock.Mock(
+                return_value=[
+                    {
+                        "name": "test-results",
+                        "size_in_bytes": 2048,
+                        "expired": False,
+                        "artifact_slug": "test-results",
+                    }
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-downloader", "artifact", "list", "123"],
+        )
+        cli_mod.main_downloader()
         out = capsys.readouterr().out
         assert "test-results" in out
-        assert "build-logs" not in out
+        assert "slug: test-results" in out
 
-    def test_job_id_no_artifact_ids_empty_output(self, monkeypatch, capsys):
-        art1 = ArtifactData.model_validate(
-            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
-        )
+    def test_artifact_list_all(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "gha_downloader.cli.get_artifacts",
-            mock.Mock(return_value=[art1]),
-        )
-        monkeypatch.setattr(
-            "gha_downloader.cli.get_log_text",
-            mock.Mock(return_value="no artifact lines here\n"),
+            cli_mod,
+            "list_artifacts",
+            mock.Mock(
+                return_value=[
+                    {
+                        "name": "old",
+                        "size_in_bytes": 512,
+                        "expired": True,
+                        "artifact_slug": "old",
+                    }
+                ]
+            ),
         )
         monkeypatch.setattr(
             "sys.argv",
-            ["gha-download", "12345", "--list-artifacts", "--job-id", "42"],
+            ["gha-downloader", "artifact", "list", "123", "--all"],
         )
-        with pytest.raises(SystemExit) as exc_info:
-            cli_mod.main_download()
-        assert exc_info.value.code == 0
+        cli_mod.main_downloader()
         out = capsys.readouterr().out
-        assert out == ""
+        assert "old" in out
+        assert "expired" in out
 
-    def test_no_job_id_returns_full_list(self, monkeypatch, capsys):
-        art1 = ArtifactData.model_validate(
-            {"id": 100, "name": "test-results", "size_in_bytes": 2048, "expired": False}
-        )
-        art2 = ArtifactData.model_validate(
-            {"id": 200, "name": "build-logs", "size_in_bytes": 1024, "expired": False}
-        )
+    def test_artifact_download(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setattr(
-            "gha_downloader.cli.get_artifacts",
-            mock.Mock(return_value=[art1, art2]),
+            cli_mod,
+            "download_artifact",
+            mock.Mock(return_value=tmp_path / "123" / "artifacts" / "my-art"),
         )
         monkeypatch.setattr(
             "sys.argv",
-            ["gha-download", "12345", "--list-artifacts"],
+            ["gha-downloader", "artifact", "download", "123", "My Art"],
+        )
+        cli_mod.main_downloader()
+        out = capsys.readouterr().out
+        assert "my-art" in out
+
+    def test_artifact_download_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli_mod,
+            "download_artifact",
+            mock.Mock(side_effect=DownloaderError("not found")),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-downloader", "artifact", "download", "123", "missing"],
         )
         with pytest.raises(SystemExit) as exc_info:
-            cli_mod.main_download()
-        assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        assert "test-results" in out
-        assert "build-logs" in out
+            cli_mod.main_downloader()
+        assert exc_info.value.code == 2
+
+    def test_run_download_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli_mod,
+            "download_all_jobs_from_run",
+            mock.Mock(side_effect=DownloaderError("already exists")),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-downloader", "run", "download", "123"],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.main_downloader()
+        assert exc_info.value.code == 2
+
+    def test_job_download_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli_mod,
+            "download_job",
+            mock.Mock(side_effect=DownloaderError("not found")),
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gha-downloader", "job", "download", "123", "99999"],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.main_downloader()
+        assert exc_info.value.code == 2
+
+
+class TestDownloaderParser:
+    def test_run_show_parser(self):
+        parser = build_downloader_parser()
+        args = parser.parse_args(["run", "show", "123"])
+        assert args.command == "run"
+        assert args.run_command == "show"
+        assert args.run_id == 123
+
+    def test_run_download_parser(self):
+        parser = build_downloader_parser()
+        args = parser.parse_args(["run", "download", "123", "--force"])
+        assert args.run_command == "download"
+        assert args.force is True
+
+    def test_job_download_parser(self):
+        parser = build_downloader_parser()
+        args = parser.parse_args(["job", "download", "123", "42"])
+        assert args.command == "job"
+        assert args.job_id == 42
+
+    def test_artifact_list_parser(self):
+        parser = build_downloader_parser()
+        args = parser.parse_args(["artifact", "list", "123", "--all"])
+        assert args.artifact_command == "list"
+        assert args.show_all is True
+
+    def test_artifact_download_parser(self):
+        parser = build_downloader_parser()
+        args = parser.parse_args(["artifact", "download", "123", "my-artifact"])
+        assert args.artifact_command == "download"
+        assert args.artifact_name == "my-artifact"

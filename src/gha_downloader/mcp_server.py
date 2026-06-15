@@ -1,4 +1,4 @@
-import json
+import asyncio
 import logging
 import os
 import re
@@ -14,28 +14,24 @@ except ImportError as exc:
 
 import structlog
 
-from .downloader import DownloaderError, _extract_artifact_ids, slugify
-from .downloader import download_run as _download_run
-from .gh import (
-    GhError,
-    GhNotFoundError,
-    get_artifacts,
-    get_log_text,
-    get_run_view,
-)
-from .gh import download_artifact as _gh_download_artifact
+from . import downloader as _downloader
+from .downloader import DownloaderError
+from .gh import GhError
 
 mcp = FastMCP(
     "gha-downloader",
     instructions=(
         "Workflow for investigating a specific job:\n"
         "1. get_run_info — identify job names, IDs, and slugs\n"
-        "2. download_run(job_id=<id>) — download only that job's logs "
-        "(faster, avoids timeouts on large runs)\n"
+        "2. download_job(run_id=<id>, job_id=<id>) — download only "
+        "that job's logs (faster, avoids timeouts on large runs)\n"
         "3. list_logs(run_id=<id>) — list available job slugs with steps\n"
         "4. read_log_file(run_id=<id>, job_slug=<slug>) — read log "
         "content (or use native file-read tools at "
         "<run_dir>/logs/<job_slug>/full.log)\n"
+        "\n"
+        "For failure triage: download_failed_jobs(run_id=<id>) "
+        "downloads only failed/in-progress jobs in one call.\n"
         "\n"
         "For artifacts: list_artifacts → download_artifact(slug) → "
         "read_artifact_file.\n"
@@ -68,11 +64,9 @@ _ANN_LOCAL_READ_ONLY = ToolAnnotations(
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[mGKHFJABCDsu]")
 
-_LARGE_RUN_JOB_THRESHOLD = 20
-
 
 @mcp.tool(annotations=_ANN_READ_ONLY)
-def get_run_info(
+async def get_run_info(
     run_id: int,
     repo: str | None = None,
     include_steps: bool = False,
@@ -120,37 +114,26 @@ def get_run_info(
             auto-detected.
     """
     try:
-        data = get_run_view(str(run_id), repo=repo)
-        result = data.model_dump(mode="json")
-        for job in result["jobs"]:
-            job["job_slug"] = slugify(job["name"])
-            if include_steps and job.get("steps"):
-                for step in job["steps"]:
-                    if step.get("conclusion") != "skipped":
-                        step["step_label"] = (
-                            f"{step['number']:02d}_{slugify(step['name'])}"
-                        )
-            if not include_steps:
-                job.pop("steps", None)
-        if only_failed:
-            result["jobs"] = [
-                j
-                for j in result["jobs"]
-                if j.get("conclusion") not in ("success", "skipped")
-            ]
-        return result
-    except GhError as exc:
-        raise ToolError(str(exc)) from exc
+        return await asyncio.to_thread(
+            _downloader.get_run_info,
+            run_id=run_id,
+            repo=repo,
+            include_steps=include_steps,
+            only_failed=only_failed,
+        )
     except DownloaderError as exc:
+        raise ToolError(str(exc)) from exc
+    except GhError as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool(annotations=_ANN_READ_ONLY)
-def list_artifacts(  # noqa: PLR0913
+async def list_artifacts(  # noqa: PLR0913
     run_id: int,
     repo: str | None = None,
     job_id: int | None = None,
     only_available: bool = True,
+    name_contains: str | None = None,
 ) -> list[dict]:
     """List artifacts for a GitHub Actions run without downloading them.
 
@@ -165,6 +148,8 @@ def list_artifacts(  # noqa: PLR0913
         only_available: When ``True`` (default), expired artifacts
             are excluded from the returned list. When ``False``,
             all artifacts (including expired) are returned.
+        name_contains: When set, return only artifacts whose name
+            contains this substring (case-insensitive).
 
     Returns:
         List of artifact records with id, name, size_in_bytes,
@@ -178,63 +163,53 @@ def list_artifacts(  # noqa: PLR0913
             auto-detected.
     """
     try:
-        artifacts = get_artifacts(str(run_id), repo=repo)
-        if job_id is not None:
-            log_text = get_log_text(repo, job_id)
-            id_set = set(_extract_artifact_ids(log_text))
-            artifacts = [a for a in artifacts if a.artifact_id in id_set]
-        if only_available:
-            artifacts = [a for a in artifacts if not a.expired]
-        result = [a.model_dump(mode="json") for a in artifacts]
-        for artifact in result:
-            artifact["artifact_slug"] = slugify(artifact["name"])
-        return result
-    except GhNotFoundError as exc:
+        return await asyncio.to_thread(
+            _downloader.list_artifacts,
+            run_id=run_id,
+            repo=repo,
+            job_id=job_id,
+            only_available=only_available,
+            name_contains=name_contains,
+        )
+    except DownloaderError as exc:
         raise ToolError(str(exc)) from exc
     except GhError as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool(annotations=_ANN_WRITE)
-def download_run(
+async def download_job(
     run_id: int,
-    job_id: int | None,
+    job_id: int,
     repo: str | None = None,
     output_dir: str | None = None,
     force: bool = False,
 ) -> str:
-    """Download logs for a GitHub Actions run.
+    """Download logs for a single job in a GitHub Actions run.
 
     Downloads only logs and ``run.json``; artifacts are not included.
     Use ``list_artifacts`` to discover available artifacts and
     ``download_artifact`` to download individual ones.
 
-    ``job_id`` is a required parameter. Pass ``job_id=None`` to
-    download all jobs' logs, or pass a specific integer ``job_id``
-    to download a single job (significantly faster on large runs).
-    When ``job_id=None`` and the run has more than 20 jobs, the
-    return value includes a note recommending targeted ``job_id``
-    use.
-
-    When the run directory already exists and ``force`` is ``False``,
-    returns the cached path immediately without re-downloading.
+    When the job's log directory already exists and ``force`` is
+    ``False``, returns the cached path immediately without
+    re-downloading. Other jobs' logs in the same run directory
+    are not affected.
 
     Args:
         run_id: Numeric workflow run ID.
-        job_id: Required. Pass ``None`` to download all jobs, or a
-            specific integer job ID to download only that job.
+        job_id: Required integer job ID to download.
         repo: Repository in ORG/REPO format. Auto-detected if omitted
             inside a git clone.
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
-        force: Overwrite existing run directory if it already exists.
+        force: When ``True``, re-download and replace only this job's
+            log directory. Other jobs' logs are not affected.
 
     Returns:
         The absolute path of the run directory on success. Appends
-        ``(cached)`` when the directory already existed. When
-        ``job_id=None`` and the run has more than 20 jobs, appends
-        a note recommending the use of a specific ``job_id``.
+        ``(cached)`` when the job's log directory already existed.
 
     Raises:
         ToolError: If the run is not found or the repo cannot be
@@ -243,46 +218,41 @@ def download_run(
     if output_dir is None:
         output_dir = _default_output_dir()
     run_dir = Path(output_dir) / str(run_id)
-    if run_dir.is_dir() and not force:
-        return f"{run_dir.resolve()} (cached)"
     try:
-        _download_run(
+        await asyncio.to_thread(
+            _downloader.download_job,
             run_id=run_id,
-            repo=repo,
             job_id=job_id,
+            repo=repo,
             output_dir=output_dir,
             force=force,
         )
-        result = str((Path(output_dir) / str(run_id)).resolve())
-        if job_id is None:
-            run_json_path = Path(output_dir) / str(run_id) / "run.json"
-            if run_json_path.is_file():
-                run_data = json.loads(run_json_path.read_text())
-                job_count = len(run_data.get("jobs") or [])
-                if job_count > _LARGE_RUN_JOB_THRESHOLD:
-                    result += (
-                        f"\nNote: downloaded {job_count} jobs. "
-                        "For large runs, pass job_id=<id> to "
-                        "download a single job's logs."
-                    )
-        return result
     except DownloaderError as exc:
         raise ToolError(str(exc)) from exc
     except GhError as exc:
         raise ToolError(str(exc)) from exc
+    return str(run_dir.resolve())
 
 
 @mcp.tool(annotations=_ANN_WRITE)
-def download_artifact(
+async def download_artifact(
     run_id: int,
     artifact_slug: str,
     repo: str | None = None,
     output_dir: str | None = None,
+    force: bool = False,
 ) -> str:
-    """Download a single artifact by slug into the existing run directory.
+    """Download a single artifact by slug into the run directory.
 
-    The run directory must already exist (call ``download_run`` first).
-    Use ``list_artifacts`` to discover available ``artifact_slug`` values.
+    The run directory is created automatically if it does not already
+    exist.
+    Use ``list_artifacts`` to discover available ``artifact_slug``
+    values.
+
+    When ``force`` is ``False`` (default) and the artifact directory
+    already exists and is non-empty, raises a ``ToolError`` directing
+    the caller to use ``force=True``. When ``force`` is ``True`` and
+    the artifact directory exists, removes it before re-downloading.
 
     Args:
         run_id: Numeric workflow run ID.
@@ -293,51 +263,84 @@ def download_artifact(
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
+        force: When ``True``, re-download even if artifact directory
+            already exists (removes old content first).
 
     Returns:
         The absolute path of the artifact directory on success.
 
     Raises:
-        ToolError: If the run directory does not exist, the artifact
-            slug is not found, or the artifact has expired.
+        ToolError: If the artifact slug is not found, the artifact
+            has expired, or the artifact directory already exists
+            and is non-empty with ``force=False``.
     """
     if output_dir is None:
         output_dir = _default_output_dir()
-    run_dir = Path(output_dir) / str(run_id)
-    if not run_dir.is_dir():
-        raise ToolError(
-            f"Run directory {run_dir} does not exist. "
-            "Download the run first with download_run."
-        )
     try:
-        artifacts = get_artifacts(str(run_id), repo=repo)
-    except GhNotFoundError as exc:
+        art_dir = await asyncio.to_thread(
+            _downloader.download_artifact,
+            run_id=run_id,
+            artifact_slug=artifact_slug,
+            repo=repo,
+            output_dir=output_dir,
+            force=force,
+        )
+    except DownloaderError as exc:
         raise ToolError(str(exc)) from exc
     except GhError as exc:
         raise ToolError(str(exc)) from exc
+    return str(art_dir)
 
-    slug_map = {slugify(a.name): a for a in artifacts}
-    if artifact_slug not in slug_map:
-        available = sorted(slug_map)
-        raise ToolError(
-            f"Artifact slug '{artifact_slug}' not found. "
-            f"Available slugs: {', '.join(available)}"
-        )
 
-    artifact = slug_map[artifact_slug]
-    if artifact.expired:
-        raise ToolError(
-            f"Artifact '{artifact.name}' (slug: {artifact_slug}) has expired."
-        )
+@mcp.tool(annotations=_ANN_WRITE)
+async def download_failed_jobs(
+    run_id: int,
+    repo: str | None = None,
+    output_dir: str | None = None,
+    force: bool = False,
+) -> str:
+    """Download logs for only the failed jobs in a GitHub Actions run.
 
-    art_dir = run_dir / "artifacts" / artifact_slug
-    art_dir.mkdir(parents=True, exist_ok=True)
+    Identifies failed and in-progress jobs via ``get_run_info``, then
+    downloads each one. If no jobs have failed, returns a message
+    indicating no downloads were performed.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        repo: Repository in ORG/REPO format. Auto-detected if omitted
+            inside a git clone.
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+        force: Overwrite existing run directory if it already exists.
+
+    Returns:
+        The absolute path of the run directory followed by the list of
+        downloaded job slugs. If no failed jobs, a message indicating
+        no failures were found.
+
+    Raises:
+        ToolError: If the run is not found or the repo cannot be
+            auto-detected.
+    """
+    if output_dir is None:
+        output_dir = _default_output_dir()
     try:
-        _gh_download_artifact(str(run_id), artifact.name, str(art_dir), repo=repo)
+        run_dir, job_slugs = await asyncio.to_thread(
+            _downloader.download_failed_jobs,
+            run_id=run_id,
+            repo=repo,
+            output_dir=output_dir,
+            force=force,
+        )
+    except DownloaderError as exc:
+        raise ToolError(str(exc)) from exc
     except GhError as exc:
         raise ToolError(str(exc)) from exc
-
-    return str(art_dir.resolve())
+    if not job_slugs:
+        return f"No failed jobs found for run {run_id}. No downloads were performed."
+    slug_list = ", ".join(job_slugs)
+    return f"{run_dir.resolve()}\nDownloaded failed jobs: {slug_list}"
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
@@ -364,7 +367,7 @@ def list_run_files(run_id: int, output_dir: str | None = None) -> str:
     if not run_dir.is_dir():
         raise ToolError(
             f"Run directory {run_dir} does not exist. "
-            "Download the run first with download_run."
+            "Download the run first with download_job."
         )
 
     lines: list[str] = []
@@ -417,7 +420,7 @@ def list_logs(run_id: int, output_dir: str | None = None) -> str:
     if not logs_dir.is_dir():
         raise ToolError(
             f"No logs directory for run {run_id}. "
-            "Download the run first with download_run."
+            "Download the run first with download_job."
         )
 
     slugs = sorted(d.name for d in logs_dir.iterdir() if d.is_dir())
@@ -444,6 +447,8 @@ def read_log_file(  # noqa: PLR0913
     offset: int = 0,
     limit: int = 500,
     output_dir: str | None = None,
+    raw: bool = False,
+    tail: int | None = None,
 ) -> str:
     """Read the content of a downloaded log file.
 
@@ -452,16 +457,29 @@ def read_log_file(  # noqa: PLR0913
     ``logs/<job_slug>/<step_label>.txt``. Use ``list_logs`` to
     discover available ``job_slug`` and ``step_label`` values.
 
+    When ``raw`` is ``False`` (default), ANSI escape sequences are
+    stripped from the selected lines before joining.
+
+    When ``tail`` is set, returns the last ``tail`` lines of the
+    file. ``tail`` takes precedence over ``offset`` — any supplied
+    ``offset`` is ignored when ``tail`` is set.
+
     Args:
         run_id: Numeric workflow run ID.
         job_slug: Filesystem-safe slug of the job.
         step_label: Step label within the job. When ``None``, reads
             the full job log.
-        offset: 0-indexed first line to return (default 0).
+        offset: 0-indexed first line to return (default 0). Ignored
+            when ``tail`` is set.
         limit: Maximum number of lines to return (default 500).
         output_dir: Root directory for downloads. Defaults to
             ``$XDG_DATA_HOME/gha-downloader/runs`` (or
             ``~/.local/share/gha-downloader/runs``).
+        raw: When ``False`` (default), ANSI escape sequences are
+            stripped from the returned lines. When ``True``, the
+            raw content is returned as-is.
+        tail: When set, return the last N lines of the file.
+            Takes precedence over ``offset``.
 
     Returns:
         A header line ``# Lines <start>–<end> of <total>``
@@ -480,7 +498,7 @@ def read_log_file(  # noqa: PLR0913
     if not logs_dir.is_dir():
         raise ToolError(
             f"No logs directory for run {run_id}. "
-            "Download the run first with download_run."
+            "Download the run first with download_job."
         )
 
     job_dir = logs_dir / job_slug
@@ -507,8 +525,13 @@ def read_log_file(  # noqa: PLR0913
         )
 
     all_lines = target.read_text(encoding="utf-8").splitlines()
+    if not raw:
+        all_lines = [_ANSI_ESCAPE_RE.sub("", line) for line in all_lines]
     total = len(all_lines)
-    start = offset
+    if tail is not None:
+        start = max(0, total - tail)
+    else:
+        start = offset
     end = min(start + limit, total)
     selected = all_lines[start:end]
     header = f"# Lines {start + 1}–{end} of {total}"
@@ -516,12 +539,14 @@ def read_log_file(  # noqa: PLR0913
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
-def read_artifact_file(
+def read_artifact_file(  # noqa: PLR0913
     run_id: int,
     artifact_slug: str,
     file_path: str,
     output_dir: str | None = None,
     raw: bool = False,
+    offset: int = 0,
+    limit: int = 500,
 ) -> str:
     """Read the text content of a file inside a downloaded artifact directory.
 
@@ -537,9 +562,12 @@ def read_artifact_file(
         raw: When ``False`` (default), ANSI escape sequences are
             stripped from the returned text. When ``True``, the
             raw content is returned as-is.
+        offset: 0-indexed first line to return (default 0).
+        limit: Maximum number of lines to return (default 500).
 
     Returns:
-        The file content as UTF-8 text (ANSI-stripped unless
+        A header line ``# Lines <start>–<end> of <total>``
+        followed by the requested lines (ANSI-stripped unless
         ``raw=True``).
 
     Raises:
@@ -582,11 +610,18 @@ def read_artifact_file(
 
     if not raw:
         text = _ANSI_ESCAPE_RE.sub("", text)
-    return text
+
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    start = offset
+    end = min(start + limit, total)
+    selected = all_lines[start:end]
+    header = f"# Lines {start + 1}–{end} of {total}"
+    return header + "\n" + "\n".join(selected)
 
 
 @mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
-def search_log(  # noqa: PLR0913, PLR0912
+def search_log(  # noqa: PLR0913, PLR0915, PLR0912
     run_id: int,
     pattern: str,
     job_slug: str | None = None,
@@ -640,7 +675,7 @@ def search_log(  # noqa: PLR0913, PLR0912
     if not logs_dir.is_dir():
         raise ToolError(
             f"No logs directory for run {run_id}. "
-            "Download the run first with download_run."
+            "Download the run first with download_job."
         )
 
     if job_slug is not None and step_label is not None:
@@ -652,9 +687,15 @@ def search_log(  # noqa: PLR0913, PLR0912
             )
         targets: list[tuple[str, Path]] = [(job_slug, target)]
     elif job_slug is not None:
-        target = logs_dir / job_slug / "full.log"
+        job_dir = logs_dir / job_slug
+        if not job_dir.is_dir():
+            raise ToolError(
+                f"Job '{job_slug}' has not been downloaded for run {run_id}. "
+                f"Call download_job(run_id={run_id}, job_id=<id>) first."
+            )
+        target = job_dir / "full.log"
         if not target.is_file():
-            raise ToolError(f"full.log not found for job '{job_slug}' in run {run_id}.")
+            raise ToolError(f"full.log missing for job '{job_slug}' in run {run_id}.")
         targets = [(job_slug, target)]
     else:
         targets = sorted(
@@ -676,7 +717,8 @@ def search_log(  # noqa: PLR0913, PLR0912
                 start = max(0, i - context_lines)
                 end = min(len(lines), i + context_lines + 1)
                 for j in range(start, end):
-                    matches.append(f"{slug}:{j + 1}: {lines[j]}")
+                    clean = _ANSI_ESCAPE_RE.sub("", lines[j])
+                    matches.append(f"{slug}:{j + 1}: {clean}")
                     if max_results is not None:
                         total_lines += 1
                         if total_lines >= max_results:
@@ -699,6 +741,51 @@ def search_log(  # noqa: PLR0913, PLR0912
             "narrow search with job_slug or step_label for more]"
         )
     return result
+
+
+@mcp.tool(annotations=_ANN_LOCAL_READ_ONLY)
+def list_artifact_files(
+    run_id: int,
+    artifact_slug: str,
+    output_dir: str | None = None,
+) -> str:
+    """List files within a downloaded artifact directory.
+
+    The artifact must have been downloaded first using
+    ``download_artifact``.
+
+    Args:
+        run_id: Numeric workflow run ID.
+        artifact_slug: Slug of the artifact directory (derived from
+            the artifact name).
+        output_dir: Root directory for downloads. Defaults to
+            ``$XDG_DATA_HOME/gha-downloader/runs`` (or
+            ``~/.local/share/gha-downloader/runs``).
+
+    Returns:
+        Newline-separated relative file paths within the artifact
+        directory.
+
+    Raises:
+        ToolError: If the artifact directory does not exist (call
+            ``download_artifact`` first).
+    """
+    if output_dir is None:
+        output_dir = _default_output_dir()
+    run_dir = Path(output_dir) / str(run_id)
+    art_dir = run_dir / "artifacts" / artifact_slug
+
+    if not art_dir.is_dir():
+        raise ToolError(
+            f"Artifact directory '{artifact_slug}' does not exist. "
+            "Download the artifact first with download_artifact."
+        )
+
+    lines: list[str] = []
+    for path in sorted(art_dir.rglob("*")):
+        if path.is_file():
+            lines.append(str(path.relative_to(art_dir)))
+    return "\n".join(lines)
 
 
 def main_mcp() -> None:

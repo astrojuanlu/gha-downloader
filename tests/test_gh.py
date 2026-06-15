@@ -432,3 +432,31 @@ def test_get_workflow_yaml_content_error_returns_none(monkeypatch):
         "myorg/myrepo", ".github/workflows/ci.yml", "abc123"
     )
     assert result is None
+
+
+def test_run_gh_timeout_raises_network_error(monkeypatch):
+    find_gh.cache_clear()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        mock.Mock(side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=120)),
+    )
+    monkeypatch.setattr(
+        "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
+    )
+    with pytest.raises(GhNetworkError, match="timed out"):
+        run_gh(["test"])
+
+
+def test_run_gh_within_timeout_succeeds(monkeypatch):
+    find_gh.cache_clear()
+    monkeypatch.setattr(
+        subprocess, "run", mock.Mock(return_value=_make_result(stdout="ok"))
+    )
+    monkeypatch.setattr(
+        "gha_downloader.gh.shutil.which", mock.Mock(return_value="/usr/bin/gh")
+    )
+    result = run_gh(["test"], timeout=30)
+    assert result.stdout == "ok"
+    call_kwargs = subprocess.run.call_args[1]
+    assert call_kwargs["timeout"] == 30
